@@ -1,0 +1,17 @@
+# Cortexus — dependências.
+# Instalar com o venv ativado:  pip install -r requirements.txt
+#
+# O extra [litellm] é OBRIGATÓRIO para usar Ollama: desde o crewai 1.x,
+# o LiteLLM (roteador que entende o prefixo "ollama/" no nome do modelo)
+# é opcional e não vem na instalação base.
+#
+# Tamanho: a instalação completa ocupa ~700 MB no venv (chromadb,
+# lancedb, pyarrow, onnxruntime vêm como dependências transitivas).
+#
+# NÃO instale crewai[tools]: verificado em jul/2026 que nenhuma ferramenta
+# de busca NA WEB embutida funciona sem chave de API (a única busca
+# gratuita, ArxivPaperTool, cobre só artigos do arXiv). A busca web do
+# projeto usa o ddgs (metabusca gratuita, sem chave — sucessor do
+# duckduckgo-search).
+crewai[litellm]>=1.15,<2.0
+ddgs>=9.14,<10

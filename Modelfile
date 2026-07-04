@@ -1,0 +1,15 @@
+# Cortexus — variante do llama3.1 com janela de contexto de 8192 tokens.
+#
+# Por que existe: o padrão do Ollama (4096) trunca silenciosamente o
+# COMEÇO do prompt ao estourar — justamente as instruções de ferramenta
+# do CrewAI — e passar num_ctx pelo LLM(...) do CrewAI 1.15.1 quebra
+# ("Completions.create() got an unexpected keyword argument 'num_ctx'",
+# verificado empiricamente em 2026-07-04). A solução é assar o parâmetro
+# numa variante local do modelo.
+#
+# Criar (após `ollama pull llama3.1`, na pasta do projeto):
+#   ollama create llama3.1-8k -f Modelfile
+#
+# 8192 tokens cabem na RTX 4060: ~4,9 GB de pesos + ~1 GB de cache KV.
+FROM llama3.1
+PARAMETER num_ctx 8192

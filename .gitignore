@@ -1,0 +1,25 @@
+# Ambientes virtuais — NUNCA versionar nem compartilhar entre SOs.
+# O venv criado no Windows não funciona no Linux (e vice-versa):
+# crie um em cada sistema (instruções no README.md).
+.venv*/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Saídas geradas pelos agentes
+output/*.txt
+
+# Segredos / configuração local
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Config local de ferramentas de IA
+.claude/
