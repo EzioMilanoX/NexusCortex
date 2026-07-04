@@ -1,4 +1,4 @@
-# Cortexus
+# NexusCortex(NCX)
 
 Servidor local de múltiplos agentes de IA — 100% gratuito, 100% offline —
 construído com [CrewAI](https://docs.crewai.com) (orquestração) e
@@ -36,7 +36,7 @@ relatório `.txt` em `output/`.
 ## Estrutura
 
 ```
-Cortexus/
+NexusCortex/
 ├── main.py            # a agência: agentes, tarefas e orquestração
 ├── Modelfile          # variante llama3.1-8k (num_ctx 8192)
 ├── requirements.txt   # dependências Python
@@ -63,7 +63,6 @@ Cortexus/
 winget install Python.Python.3.12
 
 # 1. Entrar na pasta do projeto
-cd "C:\Users\Enzo Lai\Documents\PersonalProjects\NexusCortex(NCX)"
 
 # 2. Criar o venv com o Python 3.12 (o launcher 'py' escolhe a versão)
 py -3.12 -m venv .venv
@@ -85,7 +84,6 @@ pip install -r requirements.txt
 sudo apt update && sudo apt install -y python3-venv python3-pip
 
 # 1. Entrar na pasta do projeto
-cd ~/Documentos/PersonalProjects/NexusCortex\(NCX\)   # ajuste ao seu caminho
 
 # 2. Criar o venv (separado do venv do Windows — eles NÃO são portáveis
 #    entre SOs; o .gitignore já exclui os dois)
