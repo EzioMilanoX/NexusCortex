@@ -8,10 +8,30 @@
 # Tamanho: a instalação completa ocupa ~700 MB no venv (chromadb,
 # lancedb, pyarrow, onnxruntime vêm como dependências transitivas).
 #
-# NÃO instale crewai[tools]: verificado em jul/2026 que nenhuma ferramenta
-# de busca NA WEB embutida funciona sem chave de API (a única busca
-# gratuita, ArxivPaperTool, cobre só artigos do arXiv). A busca web do
-# projeto usa o ddgs (metabusca gratuita, sem chave — sucessor do
-# duckduckgo-search).
+# crewai-tools: usado SÓ por DirectoryReadTool/FileReadTool (leitura local
+# de disco, Nível 1). Nenhuma ferramenta de busca NA WEB embutida nele
+# funciona sem chave de API (a única gratuita, ArxivPaperTool, cobre só
+# artigos do arXiv) — por isso a busca web do projeto continua via ddgs
+# (metabusca gratuita, sem chave — sucessor do duckduckgo-search).
+# Custo em disco: ~0 extra, reaproveita dependências que o crewai já traz.
 crewai[litellm]>=1.15,<2.0
+crewai-tools>=1.15,<2.0
 ddgs>=9.14,<10
+
+# ollama (cliente oficial): necessário pelo embedder da Memória (Nível 2).
+# É uma dependência diferente do LiteLLM usado para o chat — o chromadb
+# importa "from ollama import Client" internamente e falha sem isso.
+ollama>=0.6,<1.0
+
+# API local (Níveis 3-4). O extra [standard] do uvicorn traz o watchfiles,
+# OBRIGATÓRIO para o reload_excludes do api.py funcionar — sem ele, o
+# reload reiniciaria o servidor quando a agência grava em output/ e
+# mataria o próprio job em andamento.
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+
+# Painel visual (ui.py). O 'requests' é usado pelo ui.py para falar com a
+# API; já vem como dependência transitiva, mas é declarado por ser import
+# direto do projeto.
+streamlit>=1.40,<2.0
+requests>=2.32,<3.0

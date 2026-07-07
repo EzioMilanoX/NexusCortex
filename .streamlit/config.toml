@@ -1,0 +1,8 @@
+# Config do painel Streamlit (viaja no git, vale nos dois SOs).
+# gatherUsageStats=false desliga a telemetria E suprime o prompt de e-mail
+# de primeira execução que, senão, trava o terminal esperando input.
+[server]
+port = 8501
+
+[browser]
+gatherUsageStats = false

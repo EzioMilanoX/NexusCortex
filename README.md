@@ -4,19 +4,51 @@ Servidor local de múltiplos agentes de IA — 100% gratuito, 100% offline —
 construído com [CrewAI](https://docs.crewai.com) (orquestração) e
 [Ollama](https://ollama.com) (inferência local do LLM).
 
-**Equipe atual:** `Pesquisador Sênior` (com busca web real e gratuita via
-`ddgs`) → `Escritor Técnico` → `Revisor de Qualidade`, gerando um
-relatório `.txt` em `output/`.
+**Equipe atual:** `Pesquisador e Coletor de Dados` (busca web via `ddgs` +
+leitura de disco) → `Especialista em Resolução` (escreve código/prosa e tem
+terminal sandboxed) → `Engenheiro de Qualidade`, gerando o arquivo final em
+`output/`. Roda pelo terminal (`python main.py`) ou como **API HTTP** para o
+n8n (`python api.py`).
+
+**Capacidades por nível:** (1) lê pastas/arquivos locais; (2) memória de
+longo prazo via ChromaDB + embeddings locais; (3) API FastAPI; (4) API
+assíncrona (não trava o n8n) + agente com terminal sandboxed.
 
 ## Arquitetura e decisões de projeto
 
 - **Cross-platform (Windows 11 + Linux Mint):** todo caminho de arquivo usa
   `pathlib` — nunca strings com `/` ou `\`. O código é idêntico nos dois
   sistemas; só o *venv* é separado (um por SO, ver abaixo).
+- **Modelo (`qwen2.5` 7B):** trocado do `llama3.1` 8B no Nível 4 — é o
+  modelo local ~7B que a comunidade CrewAI reporta como o tool-caller mais
+  confiável, com melhor pt-BR. O **32B pedido não cabe** na RTX 4060 (~20 GB
+  de pesos → transborda para a CPU a ~3-6 tok/s = horas por job); o 14B
+  forçaria split GPU/CPU. O 7B a 8k usa ~6 GB e roda 100% na GPU.
 - **GPU (RTX 4060, 8 GB VRAM):** o offload para CUDA **não é configurado no
   Python** — é responsabilidade do servidor Ollama, que detecta o driver
-  NVIDIA automaticamente. O `llama3.1` 8B quantizado (~4,9 GB) cabe inteiro
+  NVIDIA automaticamente. O `qwen2.5` 7B quantizado (~4,7 GB) cabe inteiro
   na VRAM, então roda 100% na GPU e deixa a CPU livre.
+- **Memória de longo prazo (Nível 2), agora opt-in:** `Crew(memory=...)` com
+  embeddings **locais** (`nomic-embed-text` via Ollama) — nunca bate na API
+  da OpenAI. O armazenamento (ChromaDB) fica em `%LOCALAPPDATA%\crewai\`
+  (fora do repo). **Desligada por padrão:** o toggle "Usar Memória de Longo
+  Prazo" no painel a liga por execução. O motivo do default off: com o
+  modelo 7B, a memória às vezes faz a agência recuperar e repetir a saída de
+  uma tarefa anterior parecida (contaminação) — ligue só quando o histórico
+  entre execuções agregar valor.
+- **Tool-calling forçado a ReAct (fix crítico do Nível 4):** com memória
+  ligada, o CrewAI usaria o executor de function-calling NATIVO, e nesse
+  caminho o qwen2.5 devolve resposta vazia quando o prompt cresce
+  (`Invalid response from LLM call - None or empty`) — reproduzido 2/2. A
+  fábrica `criar_llm()` sobrescreve `supports_function_calling` na instância
+  do LLM para False, mantendo o laço ReAct (texto puro, higienizado por
+  `limpar_saida`). Não dá para subclassar: `LLM.__new__` é uma fábrica que
+  ignora subclasses.
+- **Agente com terminal (Nível 4):** o Escritor tem `executar_comando`, um
+  sandbox rígido (`shell=False`, allowlist de executáveis, denylist de
+  flags perigosas do git, confinado ao projeto, timeout 120s, `stdin`
+  fechado). Só `python <script no projeto>`, `git status|diff|log|add|
+  commit|show|branch` e `pytest`.
 - **Encoding:** toda escrita de arquivo usa `encoding="utf-8"` explícito,
   senão o Windows grava em `cp1252` e os acentos quebram no Linux.
 - **Busca web gratuita:** ferramenta customizada com o pacote `ddgs`
@@ -36,11 +68,17 @@ relatório `.txt` em `output/`.
 ## Estrutura
 
 ```
-NexusCortex/
-├── main.py            # a agência: agentes, tarefas e orquestração
-├── Modelfile          # variante llama3.1-8k (num_ctx 8192)
+NexusCortex(NCX)/
+├── main.py            # a agência: agentes, tarefas, ferramentas, orquestração
+├── api.py             # API HTTP: /agencia (n8n) + /v1 OpenAI-compat (editores)
+├── ui.py              # painel visual em Streamlit (conversa com a api.py)
+├── cortexus.bat       # launcher de um clique (Windows)
+├── cortexus.sh        # launcher de um clique (Linux Mint)
+├── .streamlit/        # config do painel (desliga telemetria/prompt de e-mail)
+├── Modelfile          # variante llama3.1-8k (legado)
+├── Modelfile.qwen     # variante qwen2.5-8k (num_ctx 8192) — modelo atual
 ├── requirements.txt   # dependências Python
-├── output/            # relatórios gerados (ignorado pelo git)
+├── output/            # arquivos gerados (ignorado pelo git)
 ├── .gitignore
 └── README.md
 ```
@@ -114,23 +152,97 @@ pip install -r requirements.txt
   curl -fsSL https://ollama.com/install.sh | sh
   ```
 
-### 2. Baixar o modelo e criar a variante (~4,9 GB)
+### 2. Baixar os modelos e criar a variante (~5 GB)
 
 ```bash
-ollama pull llama3.1                      # baixa o modelo base
-ollama create llama3.1-8k -f Modelfile    # variante com contexto 8192
-                                          # (na pasta do projeto; custo zero
-                                          #  de disco — reutiliza as camadas)
+ollama pull qwen2.5:7b                        # modelo de chat (~4,7 GB)
+ollama create qwen2.5-8k -f Modelfile.qwen    # variante contexto 8192
+                                              # (custo zero de disco)
+ollama pull nomic-embed-text                  # embeddings da memória (~274 MB)
 ```
 
 ### 3. Rodar o Cortexus
 
+Pelo terminal:
 ```bash
 # com o venv ativado, na pasta do projeto:
 python main.py
-# ou com tema customizado:
-python main.py Energia solar no Brasil
+python main.py Energia solar no Brasil                  # tema customizado
+python main.py Crie um script da hora e salve como relogio.py   # gera código
 ```
+
+Ou como API HTTP (para o n8n / Postman):
+```bash
+python api.py                    # sobe em http://0.0.0.0:8000
+```
+- `POST /agencia` com `{"tema": "...", "webhook_url": "http://... (opcional)"}`
+  responde **na hora** com um `job_id` (não trava o n8n); a equipe roda em
+  background e, ao terminar, dispara um POST no `webhook_url`.
+- `GET /status/{job_id}` acompanha por polling; quando `status` é
+  `concluido`, traz `arquivo_salvo` e `conteudo`.
+- **Segurança/limites:** `host="0.0.0.0"` expõe na rede local sem
+  autenticação — se o n8n roda na mesma máquina, prefira `127.0.0.1`. Rode
+  com **um único worker** (o registro de jobs é em memória); reiniciar o
+  servidor perde os jobs em andamento.
+
+### Atalho de um clique (o jeito mais fácil)
+
+Há um atalho **Cortexus** na Área de Trabalho (Windows) apontando para
+`cortexus.bat`. Um duplo-clique sobe a API e o painel visual em janelas
+próprias e abre o navegador quando tudo estiver pronto — feche as duas
+janelas para desligar. No **Linux Mint**, o equivalente é `./cortexus.sh`
+(rode `chmod +x cortexus.sh` uma vez). Ambos exigem o Ollama já rodando e
+o `.venv` criado.
+
+> Recriar o atalho do zero (PowerShell), se precisar:
+> ```powershell
+> $ws = New-Object -ComObject WScript.Shell
+> $sc = $ws.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Cortexus.lnk")
+> $sc.TargetPath = "$PWD\cortexus.bat"; $sc.WorkingDirectory = "$PWD"
+> $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"; $sc.Save()
+> ```
+
+### Painel visual (Streamlit) — manualmente
+
+Se preferir subir na mão, dois processos com o venv ativado:
+```bash
+python api.py            # 1) sobe a API (o painel conversa com ela)
+streamlit run ui.py      # 2) sobe o painel (abre no navegador)
+```
+No VS Code, `Ctrl+Shift+P` → **Simple Browser: Show** → cole a URL do
+Streamlit (`http://localhost:8501`) para ficar lado a lado com o código.
+O painel oferece: toggle de **memória** na barra lateral; **abas** que
+separam a análise (prosa) do código gerado (com syntax highlighting);
+**botão de download** do arquivo; feedback de progresso via `st.status`; e
+um expander **"Ver Payload da API (Para n8n)"** com o JSON exato enviado —
+pronto para colar num nó do n8n.
+
+### Dentro do VS Code (Continue.dev / Cline) — endpoint OpenAI-compatível
+
+A API expõe `/v1/chat/completions` e `/v1/models` imitando a OpenAI, então
+extensões de IA do VS Code conversam com a agência inteira pela barra
+lateral. Com o `python api.py` no ar, configure a extensão apontando para
+**`http://localhost:8000/v1`** (com `/v1`, sem barra no fim):
+
+```yaml
+# Continue.dev (config.yaml) — provider "openai" + apiBase; a chave é fake
+models:
+  - name: Cortexus
+    provider: openai
+    model: cortexus-crew
+    apiBase: http://localhost:8000/v1
+    apiKey: sk-local
+```
+
+- Cada mensagem roda a **crew inteira** (Pesquisador → Escritor → Revisor),
+  então a resposta leva minutos. A API abre o stream na hora e manda
+  keepalives para o editor não dar timeout — mas **aumente o timeout** da
+  extensão acima do pior caso da crew.
+- É uma fachada **de chat/análise**: `tools`/`tool_choice` são ignorados, ou
+  seja, o *modo agente* do Cline (que edita arquivos via tool-use nativo)
+  não é suportado por aqui — para automação, use `POST /agencia`.
+- **Cursor não funciona** com localhost (faz proxy pela nuvem dele); o alvo
+  são Continue.dev e Cline.
 
 ### 4. Confirmar que a inferência está na VRAM da RTX 4060
 
@@ -146,7 +258,7 @@ A coluna **PROCESSOR** deve mostrar **`100% GPU`**. Se aparecer algo como
 Confirmação cruzada:
 
 - **Nos dois SOs:** `nvidia-smi` → o processo `ollama` deve aparecer
-  usando ~5–6 GB de VRAM, e `GPU-Util` sobe durante a geração.
+  usando ~5 GB de VRAM, e `GPU-Util` sobe durante a geração.
 - **Windows:** Gerenciador de Tarefas → aba *Desempenho* → GPU →
   "Memória de GPU dedicada" ocupada enquanto o modelo está carregado.
 - **Sintoma de CPU:** se os 28 núcleos baterem 100% durante a geração e a
@@ -157,16 +269,22 @@ Confirmação cruzada:
 - Reduza a janela de contexto (o cache KV também mora na VRAM). No
   `main.py`, a chamada `LLM(...)` do CrewAI repassa parâmetros extras ao
   Ollama — comece com o padrão e só ajuste se necessário.
-- Ou use uma quantização menor: `ollama pull llama3.1:8b-instruct-q4_0`.
+- Ou use uma quantização menor: `ollama pull qwen2.5:7b-instruct-q4_0`.
 
 ## Roadmap
 
-- [x] Busca web real para o Pesquisador (via `ddgs`, sem chave de API —
-      o `crewai[tools]` foi descartado: nenhuma busca na web embutida é
-      gratuita).
-- [x] Terceiro agente revisor (QA) antes da gravação do relatório.
-- [ ] Expor a agência como API local (FastAPI) para virar um "servidor"
-      de agentes de verdade.
-- [ ] Se o formato ReAct do llama3.1 se mostrar instável com ferramentas:
-      testar o prefixo `ollama_chat/llama3.1` ou trocar o Pesquisador para
-      um modelo qwen2.5-instruct (reportado como mais confiável com tools).
+- [x] Busca web real para o Pesquisador (via `ddgs`, sem chave de API).
+- [x] Terceiro agente revisor (QA) antes da gravação do arquivo.
+- [x] Leitura de pastas/arquivos locais (Nível 1).
+- [x] Memória de longo prazo com embeddings locais (Nível 2).
+- [x] API local FastAPI, assíncrona com webhook de retorno (Níveis 3-4).
+- [x] Painel visual Streamlit (`ui.py`) e endpoint OpenAI-compatível `/v1`
+      para Continue.dev / Cline dentro do VS Code (Nível 5).
+- [x] Agente com terminal sandboxed (Nível 4).
+- [x] Troca do modelo para `qwen2.5` (Nível 4).
+- [ ] Autenticação (token) na API se for exposta além do `127.0.0.1`.
+- [ ] O agente Escritor nem sempre aciona o terminal para auto-testar o
+      código (limitação do modelo 7B) — avaliar um passo de verificação
+      determinístico pós-geração para scripts `.py`.
+- [ ] Integrações do ecossistema (GitHub etc.): o `GithubSearchTool` é RAG
+      e exige token + embedder local — avaliar quando houver necessidade.

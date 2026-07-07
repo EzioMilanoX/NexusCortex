@@ -1,0 +1,15 @@
+# Variante de alto contexto do Qwen 2.5 7B para o Cortexus (Nível 4).
+#
+# Por que existe: igual ao Modelfile do llama3.1-8k — o contexto padrão do
+# Ollama (4096) trunca o começo do prompt e quebra as instruções de
+# ferramenta do CrewAI. O num_ctx é assado na variante porque passá-lo
+# pelo LLM(...) do crewai 1.15.1 quebra (kwarg não aceito).
+#
+# Criar a variante (custo de disco ~zero — reutiliza as camadas do base):
+#   ollama pull qwen2.5:7b
+#   ollama create qwen2.5-8k -f Modelfile.qwen
+#
+# VRAM na RTX 4060 (8 GB): ~4,7 GB de pesos + ~0,45 GB de cache KV a 8k
+# + buffers ≈ 6,0–6,3 GB no total → 100% GPU, como o llama3.1-8k.
+FROM qwen2.5:7b
+PARAMETER num_ctx 8192
