@@ -39,8 +39,11 @@ from pydantic import BaseModel
 from main import (
     OUTPUT_DIR,
     TEMA_PADRAO,
+    classificar_saida,
+    conteudo_para_exibicao,
     criar_llm,
     diagnostico_ollama,
+    escolher_saida,
     limpar_saida,
     montar_equipe,
     salvar_relatorio,
@@ -60,21 +63,8 @@ class PedidoAgencia(BaseModel):
     tema: str
     webhook_url: str | None = None
     usar_memoria: bool = False  # memória de longo prazo (default off; ver montar_equipe)
-
-
-# Extensões que representam CÓDIGO (vão para a aba "Código" com highlighting)
-# e o mapa para a linguagem do bloco markdown. .md/.txt são prosa (aba Análise).
-_LINGUAGEM_POR_EXT = {".py": "python", ".json": "json", ".csv": "csv"}
-
-
-def _classificar(arquivo: str) -> tuple[str, str]:
-    """A partir do nome do arquivo salvo, devolve (tipo, linguagem):
-    tipo = 'codigo' ou 'analise'; linguagem = ex. 'python' (só p/ código).
-    A extensão é a autoridade — quem a decidiu foi nome_arquivo_pedido()."""
-    ext = ("." + arquivo.rsplit(".", 1)[-1].lower()) if "." in arquivo else ""
-    if ext in _LINGUAGEM_POR_EXT:
-        return "codigo", _LINGUAGEM_POR_EXT[ext]
-    return "analise", ""
+    contexto_extra: str = ""     # texto de arquivo(s) anexado(s) no painel (upload)
+    usar_gerente: bool = False   # processo hierárquico com Gerente (default off)
 
 
 def _atualizar_job(job_id: str, **campos) -> None:
@@ -109,45 +99,71 @@ def _disparar_webhook(url: str, payload: dict) -> str | None:
         return f"falha ao entregar o webhook: {erro}"
 
 
-def _gerar_resultado(tema: str, usar_memoria: bool = False) -> tuple[str, str]:
-    """Executa a agência completa para um tema e devolve (conteudo_limpo,
-    caminho_do_arquivo). Fonte única de execução, usada pelo job assíncrono
-    e pelo endpoint OpenAI-compatível. O conteúdo devolvido é sempre LIMPO
-    (sem crases); quem exibe (ui.py) reembrulha em bloco de código se for o
-    caso — o arquivo em disco continua limpo, pronto para rodar."""
+def _gerar_resultado(
+    tema: str,
+    usar_memoria: bool = False,
+    contexto_extra: str = "",
+    usar_gerente: bool = False,
+) -> dict:
+    """Executa a agência completa e devolve um dict com DUAS versões do texto:
+
+      - conteudo:       COM as crases de markdown (```lang) — é o que vai para
+                        o front-end/editor, para o Streamlit colorir o código.
+                        Já vem sem os artefatos internos do modelo.
+      - conteudo_limpo: CRU, sem crases — idêntico ao arquivo salvo em disco,
+                        usado pelo botão de download (arquivo executável).
+
+    Também devolve arquivo/tipo/linguagem. Fonte única usada pelo job
+    assíncrono e pelo endpoint OpenAI-compatível. escolher_saida recupera o
+    código caso o Revisor o tenha apagado (Bug 1). contexto_extra é o texto
+    de arquivo(s) anexado(s) no painel, injetado no prompt do Pesquisador."""
     llm = criar_llm()  # mesma config/fix de tool-calling do main.py
-    equipe = montar_equipe(tema, llm, usar_memoria=usar_memoria)
-    resultado = limpar_saida(str(equipe.kickoff()))
-    arquivo = salvar_relatorio(resultado, tema)
-    return resultado, str(arquivo)
+    equipe = montar_equipe(
+        tema,
+        llm,
+        usar_memoria=usar_memoria,
+        contexto_extra=contexto_extra,
+        usar_gerente=usar_gerente,
+    )
+    bruto = escolher_saida(equipe.kickoff(), tema)
+    arquivo = salvar_relatorio(bruto, tema)  # arquivo cru (salvar_relatorio limpa)
+    tipo, linguagem = classificar_saida(str(arquivo))
+    return {
+        "conteudo": conteudo_para_exibicao(bruto, tipo, linguagem),
+        "conteudo_limpo": limpar_saida(bruto),
+        "arquivo": str(arquivo),
+        "tipo": tipo,
+        "linguagem": linguagem,
+    }
 
 
 def _rodar_agencia(
-    job_id: str, tema: str, webhook_url: str | None, usar_memoria: bool = False
+    job_id: str,
+    tema: str,
+    webhook_url: str | None,
+    usar_memoria: bool = False,
+    contexto_extra: str = "",
+    usar_gerente: bool = False,
 ) -> None:
     """Roda em background (threadpool do Starlette): a resposta HTTP já foi
     enviada quando isto começa, então demorar minutos aqui não trava nada."""
     _atualizar_job(job_id, status="executando")
     try:
-        resultado, arquivo = _gerar_resultado(tema, usar_memoria)
-        tipo, linguagem = _classificar(arquivo)
+        res = _gerar_resultado(tema, usar_memoria, contexto_extra, usar_gerente)
+        campos = {
+            "arquivo_salvo": res["arquivo"],
+            "conteudo": res["conteudo"],              # COM crases (p/ o painel colorir)
+            "conteudo_limpo": res["conteudo_limpo"],  # cru (p/ o download)
+            "tipo": res["tipo"],
+            "linguagem": res["linguagem"],
+        }
         _atualizar_job(
             job_id,
             status="concluido",
-            arquivo_salvo=arquivo,
-            conteudo=resultado,
-            tipo=tipo,
-            linguagem=linguagem,
             terminado_em=datetime.now().isoformat(timespec="seconds"),
+            **campos,
         )
-        payload = {
-            "job_id": job_id,
-            "status": "concluido",
-            "arquivo_salvo": arquivo,
-            "conteudo": resultado,
-            "tipo": tipo,
-            "linguagem": linguagem,
-        }
+        payload = {"job_id": job_id, "status": "concluido", **campos}
     except Exception as erro:
         _atualizar_job(
             job_id,
@@ -206,7 +222,13 @@ def executar_agencia(pedido: PedidoAgencia, tarefas: BackgroundTasks):
         }
 
     tarefas.add_task(
-        _rodar_agencia, job_id, pedido.tema, pedido.webhook_url, pedido.usar_memoria
+        _rodar_agencia,
+        job_id,
+        pedido.tema,
+        pedido.webhook_url,
+        pedido.usar_memoria,
+        pedido.contexto_extra,
+        pedido.usar_gerente,
     )
     return {
         "status": "Recebido! Pensando...",
@@ -315,7 +337,8 @@ def chat_completions(body: dict):
         if problema:
             raise HTTPException(status_code=503, detail=problema)
         try:
-            conteudo, _ = _gerar_resultado(tema)
+            # conteudo COM crases — editores renderizam markdown/código colorido
+            conteudo = _gerar_resultado(tema)["conteudo"]
         except Exception as erro:
             raise HTTPException(status_code=500, detail=str(erro)) from erro
         return {
@@ -350,7 +373,7 @@ def chat_completions(body: dict):
 
         def worker():
             try:
-                holder["res"], _ = _gerar_resultado(tema)
+                holder["res"] = _gerar_resultado(tema)["conteudo"]
             except Exception as erro:  # nunca deixa a thread morrer sem registro
                 holder["err"] = str(erro)
 

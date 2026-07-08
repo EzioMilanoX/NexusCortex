@@ -21,6 +21,11 @@ import streamlit as st
 API_BASE = "http://127.0.0.1:8000"
 TIMEOUT_JOB_S = 600          # teto de espera por um job (10 min)
 INTERVALO_POLL_S = 2.0       # de quanto em quanto tempo consulta /status
+# Teto do contexto anexado: o modelo roda com num_ctx 8192, e o prompt já
+# carrega backstory + esquemas de ferramentas. ~8000 caracteres (~2-2,5k
+# tokens) deixa folga; acima disso, truncamos para não estourar o contexto.
+MAX_CONTEXTO_CHARS = 8000
+EXTS_UPLOAD = ["txt", "py", "md", "csv"]
 
 # mime por extensão só para o download ficar "certinho" no navegador
 _MIME = {".py": "text/x-python", ".json": "application/json", ".csv": "text/csv",
@@ -30,7 +35,28 @@ st.set_page_config(page_title="Cortexus", page_icon="🧠", layout="wide")
 st.title("🧠 Cortexus")
 st.caption("Agência local de agentes de IA (CrewAI + Ollama) — 100% offline.")
 
-# --- (1) Barra lateral: controle de memória ---
+def montar_contexto_extra(arquivos) -> str:
+    """Extrai o texto dos arquivos anexados e monta um único bloco rotulado.
+    Trunca no total para não estourar o contexto do modelo (num_ctx 8192)."""
+    if not arquivos:
+        return ""
+    partes = []
+    for arq in arquivos:
+        try:
+            texto = arq.getvalue().decode("utf-8", errors="replace")
+        except Exception as erro:  # nunca deixa um arquivo ruim derrubar a UI
+            texto = f"(não consegui ler este arquivo: {erro})"
+        partes.append(f"### Arquivo: {arq.name} ###\n{texto}")
+    contexto = "\n\n".join(partes)
+    if len(contexto) > MAX_CONTEXTO_CHARS:
+        contexto = (
+            contexto[:MAX_CONTEXTO_CHARS]
+            + "\n\n[... contexto truncado para caber na janela do modelo ...]"
+        )
+    return contexto
+
+
+# --- (1) Barra lateral: memória + (2) upload de arquivos para contexto ---
 with st.sidebar:
     st.header("⚙️ Controles")
     usar_memoria = st.toggle(
@@ -43,6 +69,36 @@ with st.sidebar:
         ),
     )
     st.caption("🧠 Memória: **ligada**" if usar_memoria else "💨 Memória: **desligada**")
+
+    usar_gerente = st.toggle(
+        "Modo Gerente (Hierárquico)",
+        value=False,
+        help=(
+            "Um Gerente (LLM) convoca dinamicamente os especialistas (incl. "
+            "Arquiteto e Especialista em Integrações). Mais flexível, porém "
+            "BEM mais lento no modelo local e sem a rede de segurança que "
+            "recupera o código. Desligado = pipeline sequencial confiável."
+        ),
+    )
+    st.caption("👔 Gerente: **ativo**" if usar_gerente else "➡️ Modo: **sequencial**")
+
+    st.divider()
+    st.subheader("📎 Anexar contexto")
+    arquivos = st.file_uploader(
+        "Arraste arquivos (.txt .py .md .csv)",
+        type=EXTS_UPLOAD,
+        accept_multiple_files=True,
+        help=(
+            "O texto é extraído aqui no painel e enviado junto do pedido, "
+            "então a agência já lê o conteúdo sem usar a ferramenta de disco."
+        ),
+    )
+    contexto_extra = montar_contexto_extra(arquivos)
+    if contexto_extra:
+        st.caption(
+            f"📎 {len(arquivos)} arquivo(s), {len(contexto_extra)} caracteres "
+            "no contexto."
+        )
 
 
 def api_no_ar() -> bool:
@@ -94,26 +150,23 @@ def render_resposta(idx: int, entry: dict) -> None:
     """Desenha a resposta do assistente: (2) abas Análise/Código, (5) markdown
     com highlighting, (3) botão de download e (6) expander do payload n8n.
     Chamado tanto ao vivo quanto ao redesenhar o histórico — por isso a
-    'key' do download é indexada (widgets repetidos precisam de key única)."""
+    'key' do download é indexada (widgets repetidos precisam de key única).
+
+    'conteudo' já vem do back-end COM as crases de markdown (```lang) quando é
+    código, então basta injetá-lo via st.markdown — o Streamlit colore sozinho.
+    O download usa 'conteudo_limpo' (cru, sem crases = arquivo executável)."""
     tipo = entry.get("tipo", "analise")
     conteudo = entry.get("conteudo", "")
-    linguagem = entry.get("linguagem", "")
 
     aba_chat, aba_codigo = st.tabs(["💬 Análise", "💻 Código Gerado"])
     with aba_chat:
         if tipo == "analise":
-            st.markdown(conteudo)  # (5) prosa renderizada como markdown
+            st.markdown(conteudo)  # (5) prosa/markdown renderizada
         else:
             st.markdown("_A resposta é código — veja a aba **💻 Código Gerado**._")
     with aba_codigo:
         if tipo == "codigo":
-            # (5) crases + linguagem ativam o syntax highlighting do Streamlit.
-            # Se o próprio código contiver ``` (raro), cai no st.code, imune a
-            # quebra de cerca de código, garantindo o highlighting mesmo assim.
-            if "```" in conteudo:
-                st.code(conteudo, language=linguagem or None)
-            else:
-                st.markdown(f"```{linguagem}\n{conteudo}\n```")
+            st.markdown(conteudo)  # (5) já vem cercado com ```lang → colorido
         else:
             st.markdown("_Nenhum código gerado nesta resposta._")
 
@@ -123,7 +176,7 @@ def render_resposta(idx: int, entry: dict) -> None:
         ext = os.path.splitext(nome)[1].lower()
         st.download_button(
             f"⬇️ Baixar {nome}",
-            data=conteudo,
+            data=entry.get("conteudo_limpo", conteudo),
             file_name=nome,
             mime=_MIME.get(ext, "text/plain"),
             key=f"dl_{idx}",
@@ -159,8 +212,13 @@ if pedido:
     with st.chat_message("user"):
         st.markdown(pedido)
 
-    # (1) payload com o booleano da memória
-    payload = {"tema": pedido, "usar_memoria": usar_memoria}
+    # (1) memória + (upload) contexto + modo gerente (hierárquico)
+    payload = {
+        "tema": pedido,
+        "usar_memoria": usar_memoria,
+        "contexto_extra": contexto_extra,
+        "usar_gerente": usar_gerente,
+    }
 
     with st.chat_message("assistant"):
         # (4) st.status no lugar do spinner, com etapas
@@ -169,7 +227,8 @@ if pedido:
                 job = rodar_agencia(payload, status)
                 entry = {
                     "papel": "assistant",
-                    "conteudo": job.get("conteudo", "(sem conteúdo)"),
+                    "conteudo": job.get("conteudo", "(sem conteúdo)"),  # COM crases
+                    "conteudo_limpo": job.get("conteudo_limpo", ""),    # cru (download)
                     "tipo": job.get("tipo", "analise"),
                     "linguagem": job.get("linguagem", ""),
                     "arquivo_nome": os.path.basename(job.get("arquivo_salvo", "")) or None,

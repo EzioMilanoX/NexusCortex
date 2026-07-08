@@ -79,6 +79,37 @@ MODEL = f"ollama/{MODELO_OLLAMA}"
 
 TEMA_PADRAO = "O impacto de agentes de IA locais na privacidade de dados"
 
+# ---------------------------------------------------------------------------
+# EXTENSÕES DE SAÍDA (fonte única — usada para nomear o arquivo E para o
+# painel escolher o syntax highlighting). Antes só py/txt/md/csv/json eram
+# reconhecidas, então "salve como setup_kvm.sh" caía no fallback .txt e o
+# painel renderizava o script como texto puro (sem cores). Aqui ampliamos.
+# ---------------------------------------------------------------------------
+LINGUAGEM_POR_EXT = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".sh": "bash", ".ps1": "powershell", ".bat": "batch",
+    ".html": "html", ".css": "css", ".sql": "sql",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".xml": "xml", ".java": "java", ".c": "c", ".cpp": "cpp",
+    ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php",
+    ".dockerfile": "dockerfile",
+}
+# Extensões de prosa/dados: aceitas para nomear o arquivo, mas NÃO viram
+# aba "Código" (são renderizadas como texto/markdown na aba "Análise").
+_EXT_PROSA = (".md", ".txt", ".csv")
+# Todas as extensões que nome_arquivo_pedido aceita como nome de saída.
+EXT_SAIDA = tuple(LINGUAGEM_POR_EXT) + _EXT_PROSA
+
+
+def classificar_saida(arquivo: str) -> tuple[str, str]:
+    """A partir do nome do arquivo salvo, devolve (tipo, linguagem):
+    tipo = 'codigo' (com linguagem p/ highlighting) ou 'analise' (prosa).
+    A extensão é a autoridade — quem a decidiu foi nome_arquivo_pedido()."""
+    ext = Path(arquivo).suffix.lower()
+    if ext in LINGUAGEM_POR_EXT:
+        return "codigo", LINGUAGEM_POR_EXT[ext]
+    return "analise", ""
+
 
 def criar_llm() -> LLM:
     """Fábrica única do LLM local — usada pelo main() e pela api.py, para
@@ -370,14 +401,42 @@ def diagnostico_ollama(url: str = OLLAMA_URL, timeout: float = 5.0) -> str | Non
 # ---------------------------------------------------------------------------
 # A AGÊNCIA E SUAS TAREFAS (CREW)
 # ---------------------------------------------------------------------------
-def montar_equipe(tema: str, llm: LLM, usar_memoria: bool = False) -> Crew:
+def montar_equipe(
+    tema: str,
+    llm: LLM,
+    usar_memoria: bool = False,
+    contexto_extra: str = "",
+    usar_gerente: bool = False,
+) -> Crew:
     """Cria os agentes e define como eles interpretam o pedido do usuário.
 
     usar_memoria: liga a memória de longo prazo (ChromaDB + embeddings
     locais). Default FALSE de propósito — com o qwen 7B, a memória às vezes
     faz o modelo recuperar e repetir a saída de uma tarefa anterior parecida
     (contaminação), então ela é opt-in via o toggle do painel.
+
+    contexto_extra: texto de arquivo(s) anexado(s) no painel. É injetado no
+    TOPO da tarefa do Pesquisador como fonte primária, para a agência já ter
+    o conteúdo "na ponta da língua" sem precisar ler do disco.
+
+    usar_gerente: se True, roda em PROCESSO HIERÁRQUICO — um Gerente (LLM)
+    lê o pedido e convoca dinamicamente os especialistas (incl. Arquiteto e
+    Especialista em Integrações). Default FALSE porque o hierárquico é bem
+    mais lento no 7B (várias rodadas de delegação) E abre mão da rede de
+    segurança determinística do código (escolher_saida): a saída final passa
+    a ser a síntese do Gerente. O modo sequencial (padrão) continua sendo o
+    pipeline confiável Pesquisador -> Escritor -> Revisor.
     """
+    # Bloco de contexto (vazio se nada foi anexado) — prefixado à Tarefa 1.
+    bloco_contexto = ""
+    if contexto_extra.strip():
+        bloco_contexto = (
+            "CONTEXTO FORNECIDO PELO USUÁRIO (fonte PRIMÁRIA — use este "
+            "conteúdo para responder e NÃO tente relê-lo do disco):\n"
+            "<<<CONTEXTO>>>\n"
+            f"{contexto_extra.strip()}\n"
+            "<<<FIM DO CONTEXTO>>>\n\n"
+        )
 
     # AGENTE 1: O Coletor de Dados
     pesquisador = Agent(
@@ -457,9 +516,10 @@ def montar_equipe(tema: str, llm: LLM, usar_memoria: bool = False) -> Crew:
             "Você recebe o pedido original e o rascunho do Escritor, e "
             "aplica a mesma classificação: AÇÃO DE CRIAÇÃO (código) ou "
             "AÇÃO DE ANÁLISE (prosa).\n"
-            "- Se for CRIAÇÃO: corte TUDO que não for código executável — "
-            "frases como 'Aqui está o script', saudações, explicações. "
-            "Devolva só o código.\n"
+            "- Se for CRIAÇÃO: É OBRIGATÓRIO que a sua resposta final seja "
+            "APENAS o bloco de código cru e funcional. Remova TUDO que for "
+            "texto explicativo, mas NUNCA, sob nenhuma hipótese, remova, "
+            "narre ou resuma a sintaxe do código.\n"
             "- Se for ANÁLISE: mantenha o texto em prosa. Corte apenas "
             "tagarelice conversacional ('Aqui está o resumo:', 'Espero "
             "ter ajudado'). Se o rascunho veio como código em vez de "
@@ -471,13 +531,54 @@ def montar_equipe(tema: str, llm: LLM, usar_memoria: bool = False) -> Crew:
         verbose=True,
     )
 
+    # AGENTES 4 e 5: só participam no MODO GERENTE (hierárquico). O Gerente
+    # os convoca quando o pedido justifica; no modo sequencial não entram.
+    arquiteto = Agent(
+        role="Arquiteto de Software",
+        goal=(
+            "Rascunhar a arquitetura de sistemas complexos antes de programar: "
+            "bibliotecas, módulos e estrutura de diretórios."
+        ),
+        backstory=(
+            "Você é um arquiteto de software. Para pedidos de sistemas ou "
+            "infraestrutura (ex.: KVM/QEMU, um player de música, uma API), "
+            "você define quais bibliotecas usar e como organizar os arquivos "
+            "e módulos — um plano enxuto e prático para o Escritor programar "
+            "em cima. Não escreve o código final; entrega a planta."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    especialista_integracoes = Agent(
+        role="Especialista em Integrações",
+        goal=(
+            "Garantir que webhooks e requisições de API do código estejam "
+            "bem estruturados para automação (n8n, ClickUp, etc.)."
+        ),
+        backstory=(
+            "Você é especialista em integrações e automação. Lê o código "
+            "gerado e valida os pontos de integração: payloads JSON, headers, "
+            "métodos HTTP, tratamento de erro dos webhooks/requests — deixando "
+            "tudo pronto para ser consumido por plataformas como o n8n. "
+            "Ajusta o código quando necessário, mas devolve CÓDIGO, não prosa."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
     # TAREFA 1: Pesquisa Dinâmica
     pesquisa = Task(
         description=(
+            f"{bloco_contexto}"
             f"Analise o pedido: '{tema}'.\n"
-            "- Se ele mencionar arquivos, pastas ou o próprio projeto, use "
-            "'List files in directory' e/ou 'Read a file's content' "
-            f"(diretório padrão, se nenhum for citado: '{BASE_DIR}').\n"
+            "- Se houver CONTEXTO FORNECIDO acima, trate-o como fonte "
+            "primária e NÃO use ferramentas de disco para reobtê-lo.\n"
+            "- Se ele mencionar arquivos, pastas ou o próprio projeto (e não "
+            "estiverem no contexto acima), use 'List files in directory' "
+            f"e/ou 'Read a file's content' (padrão: '{BASE_DIR}').\n"
             "- Use a 'Busca na Web' apenas se precisar de informações "
             "externas ou atuais.\n"
             "- Se for um script simples de sistema sem dependência de "
@@ -528,8 +629,11 @@ def montar_equipe(tema: str, llm: LLM, usar_memoria: bool = False) -> Crew:
             f"Revise o trabalho do Escritor para o pedido: '{tema}'.\n"
             "1) Classifique de novo o pedido original: AÇÃO DE CRIAÇÃO ou "
             "AÇÃO DE ANÁLISE (mesmos critérios da Tarefa 2).\n"
-            "2) Se CRIAÇÃO: remova TODO texto explicativo, saudações ou "
-            "conselhos ao redor do código. Devolva APENAS o código.\n"
+            "2) Se CRIAÇÃO: remova o texto explicativo/saudações que estão "
+            "AO REDOR do código e devolva APENAS o código. NUNCA apague o "
+            "código gerado pelo Escritor — copie TODAS as linhas dele "
+            "exatamente. Se ficar em dúvida, prefira devolver o código do "
+            "Escritor inteiro a devolver uma explicação sem código.\n"
             "3) Se ANÁLISE: garanta que a saída é um relatório técnico em "
             "prosa — SEM bloco de código. Se o Escritor entregou código "
             "por engano, reescreva como texto corrido usando os achados "
@@ -544,44 +648,82 @@ def montar_equipe(tema: str, llm: LLM, usar_memoria: bool = False) -> Crew:
         context=[pesquisa, redacao], # Precisa da pesquisa para reescrever em prosa se o Escritor errar
     )
 
-    kwargs_crew = {
-        "agents": [pesquisador, escritor, revisor],
-        "tasks": [pesquisa, redacao, revisao],
-        "process": Process.sequential,
-        "verbose": True,
-    }
+    kwargs_crew = {"verbose": True}
     if usar_memoria:
         # Só configura memória (e o embedder local) quando pedida — com ela
         # desligada, nem o embedder nomic-embed-text é necessário.
         kwargs_crew["memory"] = True
         kwargs_crew["embedder"] = {
             "provider": "ollama",
-            "config": {
-                "model_name": "nomic-embed-text",
-                "url": OLLAMA_URL,
-            },
+            "config": {"model_name": "nomic-embed-text", "url": OLLAMA_URL},
         }
+
+    if usar_gerente:
+        # MODO GERENTE (hierárquico): um Gerente auto-criado (manager_llm) lê a
+        # tarefa e delega aos 5 especialistas via ferramentas de delegação (que,
+        # com supports_function_calling=False, rodam pelo caminho ReAct — testado
+        # e funcional com o qwen local). Uma ÚNICA tarefa descreve o objetivo e
+        # o fluxo; o Gerente decide quem convocar.
+        entrega = Task(
+            description=(
+                f"{bloco_contexto}"
+                f"Pedido do usuário: '{tema}'.\n\n"
+                "Coordene a equipe para entregar o melhor resultado, seguindo a "
+                "REGRA DE INTENCIONALIDADE:\n"
+                "- CRIAÇÃO (criar/escrever/desenvolver/gerar um script, programa "
+                "ou função): a entrega final é APENAS código cru e funcional, "
+                "sem texto explicativo ao redor.\n"
+                "- ANÁLISE (explicar/resumir/analisar/auditar algo existente): a "
+                "entrega final é um relatório técnico em prosa, SEM bloco de "
+                "código.\n\n"
+                "FLUXO SUGERIDO (delegue só o que fizer sentido):\n"
+                "1. Pesquisador: levanta fatos (web/disco/contexto fornecido).\n"
+                "2. Arquiteto: SÓ para sistemas/infra complexos — rascunha "
+                "bibliotecas e estrutura antes de programar.\n"
+                "3. Escritor: produz o código ou a prosa.\n"
+                "4. Especialista em Integrações: SÓ se envolver n8n/webhook/API — "
+                "valida os pontos de integração do código.\n"
+                "5. Engenheiro de Qualidade: limpa a saída final (tira tagarelice; "
+                "NUNCA apaga o código numa Ação de Criação)."
+            ),
+            expected_output=(
+                "A entrega final no formato certo pela Regra de Intencionalidade: "
+                "código cru (Criação) ou relatório em prosa (Análise)."
+            ),
+        )
+        kwargs_crew.update(
+            agents=[pesquisador, arquiteto, escritor, especialista_integracoes, revisor],
+            tasks=[entrega],
+            process=Process.hierarchical,
+            manager_llm=llm,
+        )
+    else:
+        # MODO SEQUENCIAL (padrão): pipeline determinístico e confiável.
+        kwargs_crew.update(
+            agents=[pesquisador, escritor, revisor],
+            tasks=[pesquisa, redacao, revisao],
+            process=Process.sequential,
+        )
     return Crew(**kwargs_crew)
 
 # ---------------------------------------------------------------------------
 # PROCESSAMENTO DE SAÍDA E SALVAMENTO DE ARQUIVOS
 # ---------------------------------------------------------------------------
-def limpar_saida(texto: str) -> str:
-    """Remove artefatos do laço ReAct, crases de markdown e rótulos vazados."""
-    # 1. Remove vazamentos do pensamento lógico do modelo (ex: "Final Answer:")
+def _limpar_artefatos(texto: str) -> str:
+    """Remove os vazamentos INTERNOS do modelo (rótulos "Final Answer",
+    classificações, tool-calls JSON, andaime ReAct) — SEM tocar nas crases
+    de markdown. É a base compartilhada: para o painel colorir, o conteúdo
+    precisa manter os blocos ```lang, mas nunca pode carregar esse lixo.
+    """
+    # 1. Vazamentos do pensamento lógico do modelo (ex: "Final Answer:")
     texto = re.sub(
         r"^[\s*#]*(resposta final|final answer)[ \t]*:?[ \t]*\**[ \t]*(?:\r?\n)*",
         "",
         texto.strip(),
         flags=re.IGNORECASE | re.MULTILINE,
     )
-    
-    # 2. Remove crases de Markdown de blocos de código
-    texto = re.sub(r"^```[a-zA-Z]*\n", "", texto)
-    texto = re.sub(r"\n```$", "", texto)
-    
-    # 3. NOVO: Remove os rótulos internos de classificação e memória vazados
-    # Utilizamos re.MULTILINE para garantir a varredura em todo o corpo do texto
+
+    # 2. Rótulos internos de classificação e memória vazados
     texto = re.sub(
         r"^[\s*#]*(Classifica[çc][ãa]o|A[CÇ][ÃA]O DE AN[ÁA]LISE|A[CÇ][ÃA]O DE CRIA[CÇ][ÃA]O|Mem[óo]rias Relevantes|Mem[óo]rias Relevantes Fim|A[çc][ãa]o de An[áa]lise Conclu[íi]da|Resposta Final)[ \t]*:?[ \t]*\**.*?(?:\r?\n)*",
         "",
@@ -589,11 +731,9 @@ def limpar_saida(texto: str) -> str:
         flags=re.IGNORECASE | re.MULTILINE,
     )
 
-    # 4. Remove tool-calls internas vazadas no FINAL do texto (bug real:
-    # o modelo tentou acionar a memória com o JSON '{"name": "search_memory",
-    # "arguments": ...}' e imprimiu o próprio pensamento no relatório).
-    # Só remove se o JSON citar uma ferramenta interna conhecida — assim um
-    # código legítimo gerado numa Ação de Criação nunca é afetado.
+    # 3. Tool-calls internas vazadas no FINAL (ex.: JSON '{"name":
+    # "search_memory", ...}'). Só remove se citar uma ferramenta conhecida —
+    # um dict legítimo do código do usuário nunca é afetado.
     ferramentas_internas = (
         r"search_memory|busca[_ ]?na[_ ]?web|read_a_file'?s?_?content"
         r"|list_files_in_directory|executar_comando"
@@ -606,16 +746,124 @@ def limpar_saida(texto: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 5. Remove andaime ReAct vazado no final (linhas "Thought:"/"Action:"/
-    # "Action Input:"/"Observation:" até o fim do texto). São as palavras
-    # exatas do protocolo interno em inglês — não colidem com prosa em pt-BR.
-    texto = re.sub(
-        r"(?:^|\n)[ \t]*(?:Thought|Action|Action Input|Observation)[ \t]*:[\s\S]*$",
-        "",
-        texto,
-    )
+    # 4. Andaime ReAct vazado no final. Só dispara a partir de "Thought:" (o
+    # início canônico do laço) para não apagar código que tenha comentários
+    # como "# Observation: ...".
+    texto = re.sub(r"(?:^|\n)[ \t]*Thought[ \t]*:[\s\S]*$", "", texto)
 
     return texto.strip()
+
+
+def limpar_saida(texto: str) -> str:
+    """Versão para DISCO: limpa os artefatos internos E arranca as crases de
+    markdown, para o arquivo salvo (.py/.sh/...) ficar cru e executável.
+    O painel usa outra via (com as crases) — ver conteudo_para_exibicao."""
+    texto = _limpar_artefatos(texto)
+    texto = re.sub(r"^```[a-zA-Z0-9]*\n", "", texto)   # crase de abertura
+    texto = re.sub(r"\n```$", "", texto)               # crase de fechamento
+    return texto.strip()
+
+
+def conteudo_para_exibicao(bruto: str, tipo: str, linguagem: str) -> str:
+    """Versão do conteúdo para o PAINEL / editor de código: sem os artefatos
+    internos do modelo, mas COM as crases de markdown para o Streamlit ativar
+    o syntax highlighting. Para código, devolve exatamente UM bloco cercado
+    com a linguagem certa (mesmo que o modelo não tenha cercado). Para prosa,
+    devolve o texto com o markdown preservado. É a contrapartida do arquivo
+    em disco: aqui as crases FICAM; em salvar_relatorio elas são removidas."""
+    if tipo == "codigo":
+        return f"```{linguagem}\n{limpar_saida(bruto)}\n```"
+    return _limpar_artefatos(bruto)
+
+
+def _extrair_bloco_codigo(texto: str) -> str:
+    """Se houver um bloco cercado (```lang ... ```), devolve só o miolo;
+    senão devolve o texto inteiro. Usado ao recuperar o rascunho do Escritor."""
+    m = re.search(r"```[a-zA-Z0-9]*\n(.*?)\n```", texto, flags=re.DOTALL)
+    return m.group(1) if m else texto
+
+
+def _parece_codigo(texto: str) -> bool:
+    """Heurística: o texto tem cara de código-fonte (vs. prosa explicativa)?
+    Usada para detectar quando o Revisor apagou o código e sobrou só texto."""
+    t = texto.strip()
+    if not t:
+        return False
+    if "```" in t:
+        return True
+    marcadores = (
+        "def ", "import ", "class ", "function ", "#!/", "</", "select ",
+        "print(", "console.log", "public ", "package ", "=>", "});",
+        "#include", "sudo ", "apt ", "$(", "echo ",
+    )
+    baixo = t.lower()
+    if any(m in baixo for m in marcadores):
+        return True
+    linhas = [ln for ln in t.splitlines() if ln.strip()]
+    if linhas:
+        sinais = sum(
+            1 for ln in linhas
+            if ln[:1] in " \t" or ln.rstrip().endswith((";", "{", "}", ":", ")"))
+        )
+        if sinais / len(linhas) >= 0.4:
+            return True
+    return False
+
+
+# Verbos de CRIAÇÃO de código (palavra inteira). Usados como segundo sinal
+# de que se esperava código, para a rede de segurança atuar mesmo sem um
+# "salve como <arquivo>" explícito no pedido.
+_VERBOS_CRIACAO = (
+    "crie", "criar", "cria",
+    "escreva", "escrever", "escreve",
+    "desenvolva", "desenvolver", "desenvolve",
+    "gere", "gerar", "gera",
+    "programe", "programar",
+    "implemente", "implementar",
+)
+_RE_VERBO_CRIACAO = re.compile(
+    r"\b(?:" + "|".join(_VERBOS_CRIACAO) + r")\b", re.IGNORECASE
+)
+
+
+def _pede_criacao(tema: str) -> bool:
+    """True se o pedido usa um verbo de criação (crie/desenvolva/gere/...)."""
+    return bool(_RE_VERBO_CRIACAO.search(tema))
+
+
+def escolher_saida(crew_output, tema: str) -> str:
+    """Rede de segurança do Bug 1: numa tarefa de CRIAÇÃO, se a saída FINAL do
+    Revisor perdeu o código e virou só prosa (ex.: 'A função X foi criada
+    para...'), recupera o rascunho do Escritor (ou do Pesquisador) via
+    tasks_output. Em tarefa de análise, ou quando o código está presente,
+    devolve a saída final normalmente.
+
+    "Espera código" quando há um nome de arquivo de código pedido OU quando o
+    tema usa um verbo de criação — assim a rede atua mesmo sem "salve como"
+    (ex.: 'Crie a função de crossfade...'). É seguro deixar amplo: a recuperação
+    só acontece se o rascunho REALMENTE parecer código (_parece_codigo), então
+    'escreva um artigo' (prosa) nunca vira resgate indevido."""
+    final = getattr(crew_output, "raw", None) or str(crew_output)
+
+    nome = nome_arquivo_pedido(tema)
+    espera_codigo = (
+        (bool(nome) and Path(nome).suffix.lower() in LINGUAGEM_POR_EXT)
+        or _pede_criacao(tema)
+    )
+    if not espera_codigo or _parece_codigo(final):
+        return final
+
+    # O final não tem código, mas era p/ ter: tenta Escritor (1) e Pesquisador (0).
+    try:
+        tarefas = list(getattr(crew_output, "tasks_output", []) or [])
+    except Exception:
+        tarefas = []
+    for i in (1, 0):
+        if i < len(tarefas):
+            bruto = getattr(tarefas[i], "raw", "") or ""
+            if _parece_codigo(bruto):
+                return _extrair_bloco_codigo(bruto)
+    return final
 
 def nome_arquivo_pedido(tema: str) -> str | None:
     """Extrai o nome do arquivo de SAÍDA pedido, se houver.
@@ -630,7 +878,10 @@ def nome_arquivo_pedido(tema: str) -> str | None:
     é um parser de linguagem natural: frases fora desses padrões caem
     no fallback com timestamp, que é o comportamento seguro.
     """
-    extensao = r"[a-zA-Z0-9_-]+\.(?:py|txt|md|csv|json)"
+    # Alternação construída a partir de EXT_SAIDA (fonte única) — assim .sh,
+    # .js, .sql etc. também são reconhecidos como nome de saída válido.
+    alt_ext = "|".join(sorted((e[1:] for e in EXT_SAIDA), key=len, reverse=True))
+    extensao = rf"[a-zA-Z0-9_-]+\.(?:{alt_ext})"
 
     # NOVO: Adicionado .*? para lidar com palavras extras entre o comando e a extensão.
     # Ex: Captura com sucesso "salve o código como servidor_teste.py"
@@ -674,10 +925,21 @@ def salvar_relatorio(conteudo: str, tema: str) -> Path:
 
     nome_arquivo = nome_arquivo_pedido(tema)
     if nome_arquivo is None:
-        # Fallback (Plano B): Se o usuário não definiu um nome com extensão,
-        # gera um arquivo de texto genérico com carimbo de data e hora.
+        # Fallback inteligente: se o usuário não deu o nome, adivinha a
+        # extensão pelo CONTEÚDO que a agência gerou (não pelo verbo do
+        # pedido). Motivo: "escreva um artigo" tem verbo de criação mas
+        # produz PROSA — salvar como .py estaria errado; _parece_codigo
+        # olha o que foi de fato produzido. Código -> .py (ou .sh se tiver
+        # shebang de shell); prosa -> .txt.
         carimbo = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        nome_arquivo = f"relatorio_{carimbo}.txt"
+        if _parece_codigo(conteudo):
+            primeira = conteudo.lstrip().splitlines()[0] if conteudo.strip() else ""
+            if primeira.startswith("#!") and ("bash" in primeira or "sh" in primeira):
+                nome_arquivo = f"script_{carimbo}.sh"
+            else:
+                nome_arquivo = f"script_{carimbo}.py"
+        else:
+            nome_arquivo = f"relatorio_{carimbo}.txt"
 
     arquivo = OUTPUT_DIR / nome_arquivo
     arquivo.write_text(conteudo + "\n", encoding="utf-8")
@@ -702,13 +964,14 @@ def main() -> int:
     equipe = montar_equipe(tema, llm)
     
     try:
-        resultado = equipe.kickoff()
+        crew_output = equipe.kickoff()
     except Exception as erro:
         print(f"\n[Cortexus] Falha crítica ao executar a equipe: {erro}")
         return 1
 
-    # Grava no disco
-    arquivo = salvar_relatorio(str(resultado), tema)
+    # escolher_saida recupera o código se o Revisor o tiver apagado (Bug 1);
+    # salvar_relatorio já aplica limpar_saida internamente.
+    arquivo = salvar_relatorio(escolher_saida(crew_output, tema), tema)
     print(f"\n[Cortexus] Concluído! Arquivo salvo em: {arquivo}")
     return 0
 
