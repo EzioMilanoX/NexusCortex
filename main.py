@@ -37,7 +37,7 @@ from pathlib import Path
 
 from crewai import Agent, Crew, LLM, Process, Task
 from crewai.tools import tool
-from crewai_tools import DirectoryReadTool, FileReadTool
+from crewai_tools import DirectoryReadTool, DirectorySearchTool, FileReadTool
 from crewai_tools.security.safe_path import (
     format_error_for_display,
     format_path_for_display,
@@ -78,6 +78,14 @@ MODELO_OLLAMA = "qwen2.5-8k"  # Variante de alto contexto (criada via Modelfile.
 MODEL = f"ollama/{MODELO_OLLAMA}"
 
 TEMA_PADRAO = "O impacto de agentes de IA locais na privacidade de dados"
+
+# Embedder LOCAL (nomic-embed-text via Ollama) — usado tanto pela memória de
+# longo prazo quanto pela Busca Semântica (RAG). Formato validado empiricamente
+# (mesmo ProviderSpec do build_embedder do CrewAI). Nunca toca na OpenAI.
+CONFIG_EMBEDDER = {
+    "provider": "ollama",
+    "config": {"model_name": "nomic-embed-text", "url": OLLAMA_URL},
+}
 
 # ---------------------------------------------------------------------------
 # EXTENSÕES DE SAÍDA (fonte única — usada para nomear o arquivo E para o
@@ -438,27 +446,40 @@ def montar_equipe(
             "<<<FIM DO CONTEXTO>>>\n\n"
         )
 
+    # BUSCA SEMÂNTICA (RAG) — criada aqui (lazy) porque o construtor da
+    # DirectorySearchTool já cria um cliente/coleção ChromaDB; deixá-la no
+    # nível do módulo pesaria todo import. Usa o embedder LOCAL nomic-embed-text.
+    # A ferramenta indexa a pasta RECURSIVAMENTE, então o prompt orienta o
+    # agente a apontar para uma SUBPASTA específica, nunca a raiz (que tem .venv).
+    busca_semantica = DirectorySearchTool(
+        name="Busca Semântica na Pasta",
+        config={"embedding_model": CONFIG_EMBEDDER},
+    )
+
     # AGENTE 1: O Coletor de Dados
     pesquisador = Agent(
         role="Pesquisador e Coletor de Dados",
         goal=f"Levantar informações, documentações ou fatos sobre: {tema}",
         backstory=(
-            "Você é um pesquisador eficiente com DUAS fontes de informação, e "
+            "Você é um pesquisador eficiente com TRÊS fontes de informação, e "
             "escolhe a certa antes de agir:\n"
-            "1) DISCO LOCAL — use 'List files in directory' e 'Read a file's "
-            "content' sempre que o pedido mencionar arquivos, pastas, "
-            "diretórios ou o próprio projeto (ex.: nomes com extensão, a "
-            f"palavra 'pasta'/'arquivo', ou um caminho). Se nenhum caminho "
-            f"for citado, use '{BASE_DIR}' como diretório padrão. Por "
-            "segurança, só é possível ler dentro da pasta do projeto.\n"
-            "2) BUSCA NA WEB — use a 'Busca na Web' para tudo que exigir "
-            "informação externa ou atual (sintaxe, melhores práticas, "
-            "notícias).\n"
-            "Não misture as duas sem necessidade. Entregue a resposta rápido."
+            "1) DISCO LOCAL (leitura direta) — use 'List files in directory' e "
+            "'Read a file's content' para listar uma pasta ou ler um arquivo "
+            "PEQUENO e específico inteiro.\n"
+            "2) BUSCA SEMÂNTICA na pasta ('Busca Semântica na Pasta') — use "
+            "quando precisar ENCONTRAR algo dentro de arquivos GRANDES ou de "
+            "uma base de código (ex.: 'onde está a função de crossfade?'). Ela "
+            "devolve só os trechos relevantes, sem estourar o contexto — "
+            "prefira-a a ler um arquivo enorme inteiro. Informe uma SUBPASTA "
+            "específica (ex.: 'src/audio'), NUNCA a raiz do projeto.\n"
+            "3) BUSCA NA WEB ('Busca na Web') — para informação externa ou "
+            "atual (sintaxe, melhores práticas, notícias).\n"
+            f"Só é possível ler/buscar dentro da pasta do projeto ('{BASE_DIR}'). "
+            "Não misture as fontes sem necessidade. Entregue a resposta rápido."
         ),
         llm=llm,
-        tools=[busca_web, leitor_pastas, leitor_arquivos],
-        max_iter=7, # Um pouco mais de margem: agora há 3 ferramentas para escolher/encadear
+        tools=[busca_web, leitor_pastas, leitor_arquivos, busca_semantica],
+        max_iter=8,  # 4 ferramentas para escolher/encadear
         allow_delegation=False,
         verbose=True,
     )
@@ -653,10 +674,7 @@ def montar_equipe(
         # Só configura memória (e o embedder local) quando pedida — com ela
         # desligada, nem o embedder nomic-embed-text é necessário.
         kwargs_crew["memory"] = True
-        kwargs_crew["embedder"] = {
-            "provider": "ollama",
-            "config": {"model_name": "nomic-embed-text", "url": OLLAMA_URL},
-        }
+        kwargs_crew["embedder"] = CONFIG_EMBEDDER
 
     if usar_gerente:
         # MODO GERENTE (hierárquico): um Gerente auto-criado (manager_llm) lê a

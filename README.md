@@ -56,6 +56,12 @@ assíncrona (não trava o n8n) + agente com terminal sandboxed.
   `crewai-tools` foram descartadas de propósito: todas exigem chave de
   API (a única busca gratuita embutida, `ArxivPaperTool`, cobre apenas
   artigos do arXiv).
+- **Busca semântica local (RAG):** o Pesquisador tem a `DirectorySearchTool`
+  para achar trechos relevantes em arquivos grandes/base de código sem ler
+  tudo (o que estouraria o contexto de 8k). Usa os embeddings **locais**
+  `nomic-embed-text` (via `CONFIG_EMBEDDER`, o mesmo da memória) — nunca a
+  OpenAI. Indexa a pasta recursivamente, então aponte para uma **subpasta
+  específica**, nunca a raiz do projeto (que contém `.venv`).
 - **Contexto do modelo:** o projeto usa a variante local `llama3.1-8k`
   (criada do [Modelfile](Modelfile) com `num_ctx 8192`) — o padrão do
   Ollama (4096) trunca silenciosamente o começo do prompt, quebrando as
