@@ -456,26 +456,43 @@ def montar_equipe(
         config={"embedding_model": CONFIG_EMBEDDER},
     )
 
-    # AGENTE 1: O Coletor de Dados
+    # AGENTE 0: O Analista de Requisitos (Engenheiro de Prompt) — atua PRIMEIRO.
+    analista = Agent(
+        role="Analista de Requisitos",
+        goal="Transformar o pedido do usuário num briefing técnico preciso.",
+        backstory=(
+            "Você é um engenheiro de prompt. Pega um pedido simples ou vago e "
+            "o expande num BRIEFING objetivo: o objetivo real, o público-alvo, "
+            "as dúvidas técnicas a responder, as restrições e os requisitos do "
+            "sistema. Você NÃO resolve o pedido nem pesquisa — apenas deixa "
+            "explícito, em tópicos, o que precisa ser investigado, para que o "
+            "Pesquisador não deixe nada escapar. Seja conciso e técnico."
+        ),
+        llm=llm,
+        allow_delegation=False,
+        verbose=True,
+    )
+
+    # AGENTE 1: O Pesquisador-Curador (rigoroso, não um mero coletor)
     pesquisador = Agent(
         role="Pesquisador e Coletor de Dados",
-        goal=f"Levantar informações, documentações ou fatos sobre: {tema}",
+        goal=f"Produzir um dossiê rigoroso e verificável sobre: {tema}",
         backstory=(
-            "Você é um pesquisador eficiente com TRÊS fontes de informação, e "
-            "escolhe a certa antes de agir:\n"
-            "1) DISCO LOCAL (leitura direta) — use 'List files in directory' e "
+            "Você é um investigador rigoroso — um CURADOR, não um mero coletor. "
+            "Trabalha com TRÊS fontes e escolhe a certa antes de agir:\n"
+            "1) DISCO LOCAL (leitura direta) — 'List files in directory' e "
             "'Read a file's content' para listar uma pasta ou ler um arquivo "
-            "PEQUENO e específico inteiro.\n"
-            "2) BUSCA SEMÂNTICA na pasta ('Busca Semântica na Pasta') — use "
-            "quando precisar ENCONTRAR algo dentro de arquivos GRANDES ou de "
-            "uma base de código (ex.: 'onde está a função de crossfade?'). Ela "
-            "devolve só os trechos relevantes, sem estourar o contexto — "
-            "prefira-a a ler um arquivo enorme inteiro. Informe uma SUBPASTA "
-            "específica (ex.: 'src/audio'), NUNCA a raiz do projeto.\n"
-            "3) BUSCA NA WEB ('Busca na Web') — para informação externa ou "
-            "atual (sintaxe, melhores práticas, notícias).\n"
-            f"Só é possível ler/buscar dentro da pasta do projeto ('{BASE_DIR}'). "
-            "Não misture as fontes sem necessidade. Entregue a resposta rápido."
+            "PEQUENO. Ao citar código, extraia o BLOCO EXATO, sem parafrasear.\n"
+            "2) BUSCA SEMÂNTICA ('Busca Semântica na Pasta') — para ENCONTRAR "
+            "trechos em arquivos GRANDES ou numa base de código; informe uma "
+            "SUBPASTA específica, NUNCA a raiz do projeto.\n"
+            "3) BUSCA NA WEB ('Busca na Web') — informação externa ou atual.\n"
+            f"Só é possível ler/buscar dentro de '{BASE_DIR}'.\n\n"
+            "RIGOR (obrigatório): avalie a CREDIBILIDADE de cada fonte "
+            "(documentação oficial > blog aleatório); descarte especulação; e "
+            "entregue um DOSSIÊ ESTRUTURADO — tópicos, cada um com o achado, a "
+            "FONTE (URL ou caminho do arquivo) e, quando for código, o trecho "
+            "exato. Nunca jogue texto corrido cru para o próximo agente."
         ),
         llm=llm,
         tools=[busca_web, leitor_pastas, leitor_arquivos, busca_semantica],
@@ -590,27 +607,48 @@ def montar_equipe(
         verbose=True,
     )
 
-    # TAREFA 1: Pesquisa Dinâmica
+    # TAREFA 0: Análise de Requisitos (expande o pedido num briefing)
+    analise_requisitos = Task(
+        description=(
+            f"{bloco_contexto}"
+            f"O pedido do usuário é: '{tema}'.\n"
+            "Transforme-o num BRIEFING técnico curto e objetivo, em tópicos: "
+            "(a) objetivo real; (b) público-alvo; (c) as dúvidas técnicas "
+            "concretas a responder; (d) restrições/requisitos relevantes. "
+            "NÃO resolva o pedido nem pesquise — só explicite o que investigar."
+        ),
+        expected_output=(
+            "Um briefing em tópicos com objetivo, público, dúvidas técnicas e "
+            "requisitos — as instruções precisas para o Pesquisador."
+        ),
+        agent=analista,
+    )
+
+    # TAREFA 1: Pesquisa Dinâmica (guiada pelo briefing; entrega um dossiê)
     pesquisa = Task(
         description=(
             f"{bloco_contexto}"
-            f"Analise o pedido: '{tema}'.\n"
+            f"Pedido original: '{tema}'. Siga o BRIEFING do Analista de "
+            "Requisitos (no contexto) para não deixar nada escapar.\n"
             "- Se houver CONTEXTO FORNECIDO acima, trate-o como fonte "
             "primária e NÃO use ferramentas de disco para reobtê-lo.\n"
-            "- Se ele mencionar arquivos, pastas ou o próprio projeto (e não "
-            "estiverem no contexto acima), use 'List files in directory' "
-            f"e/ou 'Read a file's content' (padrão: '{BASE_DIR}').\n"
-            "- Use a 'Busca na Web' apenas se precisar de informações "
-            "externas ou atuais.\n"
-            "- Se for um script simples de sistema sem dependência de "
-            "arquivos existentes, pode pular ambas e gerar apenas a lógica "
-            "principal de programação."
+            "- Arquivo/pasta/projeto pequeno: use 'List files in directory' / "
+            f"'Read a file's content' (padrão: '{BASE_DIR}').\n"
+            "- Arquivo grande / base de código: use a 'Busca Semântica na "
+            "Pasta' (subpasta específica) e extraia o trecho exato.\n"
+            "- Informação externa/atual: 'Busca na Web'.\n"
+            "- Script simples sem dependência de arquivos: pode pular as "
+            "ferramentas e esboçar só a lógica.\n"
+            "Avalie a credibilidade das fontes e entregue um DOSSIÊ "
+            "estruturado (achado + fonte/URL + código exato quando houver)."
         ),
         expected_output=(
-            "Lista de achados: conteúdo de arquivos/pastas lidos, resultados "
-            "de busca, ou lógica de programação básica."
+            "Um dossiê estruturado em tópicos: cada achado com sua fonte (URL "
+            "ou caminho) e, quando for código, o trecho exato — pronto para o "
+            "Escritor usar."
         ),
         agent=pesquisador,
+        context=[analise_requisitos],
     )
 
     # TAREFA 2: Regra de Intencionalidade (Aqui a IA classifica antes de agir)
@@ -695,13 +733,16 @@ def montar_equipe(
                 "entrega final é um relatório técnico em prosa, SEM bloco de "
                 "código.\n\n"
                 "FLUXO SUGERIDO (delegue só o que fizer sentido):\n"
-                "1. Pesquisador: levanta fatos (web/disco/contexto fornecido).\n"
-                "2. Arquiteto: SÓ para sistemas/infra complexos — rascunha "
+                "1. Analista de Requisitos: transforma o pedido num briefing "
+                "técnico (objetivo, dúvidas, requisitos) antes de tudo.\n"
+                "2. Pesquisador: levanta fatos (web/disco/busca semântica) e "
+                "monta um dossiê com fontes.\n"
+                "3. Arquiteto: SÓ para sistemas/infra complexos — rascunha "
                 "bibliotecas e estrutura antes de programar.\n"
-                "3. Escritor: produz o código ou a prosa.\n"
-                "4. Especialista em Integrações: SÓ se envolver n8n/webhook/API — "
+                "4. Escritor: produz o código ou a prosa.\n"
+                "5. Especialista em Integrações: SÓ se envolver n8n/webhook/API — "
                 "valida os pontos de integração do código.\n"
-                "5. Engenheiro de Qualidade: limpa a saída final (tira tagarelice; "
+                "6. Engenheiro de Qualidade: limpa a saída final (tira tagarelice; "
                 "NUNCA apaga o código numa Ação de Criação)."
             ),
             expected_output=(
@@ -710,16 +751,17 @@ def montar_equipe(
             ),
         )
         kwargs_crew.update(
-            agents=[pesquisador, arquiteto, escritor, especialista_integracoes, revisor],
+            agents=[analista, pesquisador, arquiteto, escritor,
+                    especialista_integracoes, revisor],
             tasks=[entrega],
             process=Process.hierarchical,
             manager_llm=llm,
         )
     else:
-        # MODO SEQUENCIAL (padrão): pipeline determinístico e confiável.
+        # MODO SEQUENCIAL (padrão): Analista -> Pesquisador -> Escritor -> Revisor.
         kwargs_crew.update(
-            agents=[pesquisador, escritor, revisor],
-            tasks=[pesquisa, redacao, revisao],
+            agents=[analista, pesquisador, escritor, revisor],
+            tasks=[analise_requisitos, pesquisa, redacao, revisao],
             process=Process.sequential,
         )
     return Crew(**kwargs_crew)
@@ -879,16 +921,19 @@ def escolher_saida(crew_output, tema: str) -> str:
     if not espera_codigo or _parece_codigo(final):
         return final
 
-    # O final não tem código, mas era p/ ter: tenta Escritor (1) e Pesquisador (0).
+    # O final não tem código, mas era p/ ter: varre as saídas anteriores (todas
+    # menos a última, que é o próprio 'final') de TRÁS pra FRENTE e recupera o
+    # rascunho de código mais recente. A varredura reversa é robusta ao tamanho
+    # do pipeline (não depende de índice fixo): com o Analista de Requisitos, o
+    # rascunho do Escritor deixou de ser sempre o índice 1.
     try:
         tarefas = list(getattr(crew_output, "tasks_output", []) or [])
     except Exception:
         tarefas = []
-    for i in (1, 0):
-        if i < len(tarefas):
-            bruto = getattr(tarefas[i], "raw", "") or ""
-            if _parece_codigo(bruto):
-                return _extrair_bloco_codigo(bruto)
+    for tarefa in reversed(tarefas[:-1]):
+        bruto = getattr(tarefa, "raw", "") or ""
+        if _parece_codigo(bruto):
+            return _extrair_bloco_codigo(bruto)
     return final
 
 def nome_arquivo_pedido(tema: str) -> str | None:
