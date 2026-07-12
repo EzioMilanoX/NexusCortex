@@ -67,6 +67,14 @@ class PedidoAgencia(BaseModel):
     usar_gerente: bool = False   # processo hierárquico com Gerente (default off)
 
 
+class NexusAssist(BaseModel):
+    """Pedido do 'microsserviço' Nexus (consumido por outro orquestrador via
+    nexus_bridge.py). Síncrono e sempre no modo SEQUENCIAL — nunca hierárquico,
+    para não criar delegação-de-agente-para-agente."""
+    tarefa: str
+    tipo: str = "pesquisa"  # "pesquisa" | "documentacao"
+
+
 def _atualizar_job(job_id: str, **campos) -> None:
     with _jobs_lock:
         if job_id in _jobs:
@@ -394,6 +402,58 @@ def chat_completions(body: dict):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+# ---------------------------------------------------------------------------
+# PONTE NEXUS (microsserviço para outro orquestrador — ex.: Roo Code)
+# ---------------------------------------------------------------------------
+@app.post("/v1/nexus-assist")
+def nexus_assist(pedido: NexusAssist):
+    """Executa a agência de forma SÍNCRONA e devolve o relatório num único
+    JSON — pensado para uma chamada pontual de outro agente (via
+    nexus_bridge.py). SEMPRE modo sequencial (usar_gerente=False): assim o
+    Nexus faz o trabalho pesado nos bastidores sem virar um Gerente que
+    delega a mais agentes (evita o loop 'agente delegando para agente').
+
+    A chamada BLOQUEIA por minutos (a crew roda inteira); o cliente CLI
+    espera. FastAPI roda esta função def numa threadpool, então o event loop
+    não trava para outras requisições."""
+    problema = diagnostico_ollama()
+    if problema:
+        raise HTTPException(status_code=503, detail=problema)
+
+    tarefa = pedido.tarefa.strip()
+    if not tarefa:
+        raise HTTPException(status_code=400, detail="O campo 'tarefa' está vazio.")
+
+    # Enquadra o pedido conforme o tipo, para orientar a Regra de Intencionalidade.
+    tipo = (pedido.tipo or "pesquisa").strip().lower()
+    if tipo == "documentacao":
+        tema = (
+            f"Documente de forma clara, técnica e estruturada (em prosa, com "
+            f"seções): {tarefa}"
+        )
+    else:  # "pesquisa" (padrão) — qualquer valor desconhecido cai aqui
+        tipo = "pesquisa"
+        tema = (
+            f"Pesquise a fundo e produza um dossiê estruturado, com fontes e "
+            f"links quando houver, sobre: {tarefa}"
+        )
+
+    try:
+        res = _gerar_resultado(tema, usar_memoria=False, usar_gerente=False)
+    except Exception as erro:
+        raise HTTPException(status_code=500, detail=str(erro)) from erro
+
+    return {
+        "status": "concluido",
+        "tipo": tipo,
+        # conteudo_limpo (sem crases) é o melhor para ler no terminal do cliente
+        "relatorio": res["conteudo_limpo"],
+        "arquivo_salvo": res["arquivo"],
+        "tipo_saida": res["tipo"],      # 'codigo' | 'analise'
+        "linguagem": res["linguagem"],
+    }
 
 
 if __name__ == "__main__":

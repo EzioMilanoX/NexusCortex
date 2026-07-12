@@ -799,11 +799,19 @@ def _parece_codigo(texto: str) -> bool:
     baixo = t.lower()
     if any(m in baixo for m in marcadores):
         return True
+    # Relatório em prosa com fontes é sinal FORTE de que NÃO é código
+    # (evita classificar um dossiê de pesquisa como .py — as linhas de
+    # links markdown terminam em ")" e enganavam a heurística abaixo).
+    if re.search(r"\]\(https?://", t) or re.search(r"(?im)^\s*fontes?\s*:", t):
+        return False
     linhas = [ln for ln in t.splitlines() if ln.strip()]
     if linhas:
+        # Só pontuação FORTE de código conta (; { }); ":" e ")" foram removidos
+        # por serem ambíguos (cabeçalhos de prosa "Fontes:" e links "](url)").
+        # Python/shell continuam pegos pela indentação e pelos marcadores acima.
         sinais = sum(
             1 for ln in linhas
-            if ln[:1] in " \t" or ln.rstrip().endswith((";", "{", "}", ":", ")"))
+            if ln[:1] in " \t" or ln.rstrip().endswith((";", "{", "}"))
         )
         if sinais / len(linhas) >= 0.4:
             return True
