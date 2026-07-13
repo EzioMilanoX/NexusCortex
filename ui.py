@@ -14,26 +14,33 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import requests
 import streamlit as st
 
 API_BASE = "http://127.0.0.1:8000"
-TIMEOUT_JOB_S = 600          # teto de espera por um job (10 min)
 INTERVALO_POLL_S = 2.0       # de quanto em quanto tempo consulta /status
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 # Teto do contexto anexado: o modelo roda com num_ctx 8192, e o prompt já
 # carrega backstory + esquemas de ferramentas. ~8000 caracteres (~2-2,5k
 # tokens) deixa folga; acima disso, truncamos para não estourar o contexto.
 MAX_CONTEXTO_CHARS = 8000
 EXTS_UPLOAD = ["txt", "py", "md", "csv"]
 
-# mime por extensão só para o download ficar "certinho" no navegador
+# linguagem por extensão (highlighting do preview / download)
+_LINGUAGEM = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript", ".sh": "bash",
+    ".ps1": "powershell", ".sql": "sql", ".html": "html", ".css": "css",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".md": "markdown",
+}
 _MIME = {".py": "text/x-python", ".json": "application/json", ".csv": "text/csv",
-         ".md": "text/markdown", ".txt": "text/plain"}
+         ".md": "text/markdown", ".sh": "text/x-shellscript", ".txt": "text/plain"}
 
 st.set_page_config(page_title="Cortexus", page_icon="🧠", layout="wide")
 st.title("🧠 Cortexus")
 st.caption("Agência local de agentes de IA (CrewAI + Ollama) — 100% offline.")
+
 
 def montar_contexto_extra(arquivos) -> str:
     """Extrai o texto dos arquivos anexados e monta um único bloco rotulado.
@@ -56,9 +63,120 @@ def montar_contexto_extra(arquivos) -> str:
     return contexto
 
 
-# --- (1) Barra lateral: memória + (2) upload de arquivos para contexto ---
+def listar_gerados() -> list[Path]:
+    """Arquivos em output/ (mais recentes primeiro), ignorando o .gitkeep."""
+    if not OUTPUT_DIR.exists():
+        return []
+    arquivos = [
+        p for p in OUTPUT_DIR.iterdir() if p.is_file() and p.name != ".gitkeep"
+    ]
+    return sorted(arquivos, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def api_no_ar() -> bool:
+    """True se a API responde — evita erros crípticos se o api.py não subiu."""
+    try:
+        requests.get(f"{API_BASE}/docs", timeout=3)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def rodar_agencia(payload: dict, status, timeout_job: int) -> dict:
+    """POST /agencia + polling em /status, atualizando o st.status com as
+    etapas. Devolve o dict final do job (concluído) ou levanta RuntimeError."""
+    try:
+        resp = requests.post(f"{API_BASE}/agencia", json=payload, timeout=15)
+    except requests.RequestException as erro:
+        raise RuntimeError(f"Não consegui falar com a API: {erro}") from erro
+    if resp.status_code == 503:
+        raise RuntimeError(resp.json().get("detail", "Ollama indisponível (503)."))
+    if resp.status_code != 200:
+        raise RuntimeError(f"A API respondeu HTTP {resp.status_code}: {resp.text[:200]}")
+
+    job_id = resp.json()["job_id"]
+    # A API só reporta na_fila/executando (não por-agente), mas o rótulo já
+    # reflete o pipeline atual de 4 etapas para dar noção do que acontece.
+    rotulos = {
+        "na_fila": "⏳ Na fila…",
+        "executando": (
+            "🧠 Analisando requisitos → pesquisando (curadoria + RAG) → "
+            "redigindo → revisando…"
+        ),
+    }
+    ultimo_estado = None
+    limite = time.monotonic() + timeout_job
+    while time.monotonic() < limite:
+        time.sleep(INTERVALO_POLL_S)
+        try:
+            job = requests.get(f"{API_BASE}/status/{job_id}", timeout=10).json()
+        except requests.RequestException:
+            continue  # falha transitória — tenta de novo no próximo ciclo
+        estado = job.get("status")
+        if estado != ultimo_estado:
+            status.write(rotulos.get(estado, estado))
+            ultimo_estado = estado
+        if estado == "concluido":
+            return job
+        if estado == "erro":
+            raise RuntimeError(job.get("detalhe", "A equipe falhou sem detalhe."))
+    raise RuntimeError(f"O job passou de {timeout_job}s sem concluir.")
+
+
+def render_resposta(idx: int, entry: dict) -> None:
+    """Desenha a resposta do assistente: abas Análise/Código (markdown com
+    highlighting), botão de download e o expander do payload para n8n.
+    Chamado ao vivo e ao redesenhar o histórico — por isso a 'key' do download
+    é indexada. 'conteudo' já vem do back-end COM as crases quando é código."""
+    tipo = entry.get("tipo", "analise")
+    conteudo = entry.get("conteudo", "")
+
+    aba_chat, aba_codigo = st.tabs(["💬 Análise", "💻 Código Gerado"])
+    with aba_chat:
+        if tipo == "analise":
+            st.markdown(conteudo)
+        else:
+            st.markdown("_A resposta é código — veja a aba **💻 Código Gerado**._")
+    with aba_codigo:
+        if tipo == "codigo":
+            st.markdown(conteudo)  # já vem cercado com ```lang → colorido
+        else:
+            st.markdown("_Nenhum código gerado nesta resposta._")
+
+    nome = entry.get("arquivo_nome")
+    if nome:
+        ext = os.path.splitext(nome)[1].lower()
+        st.download_button(
+            f"⬇️ Baixar {nome}",
+            data=entry.get("conteudo_limpo", conteudo),
+            file_name=nome,
+            mime=_MIME.get(ext, "text/plain"),
+            key=f"dl_{idx}",
+        )
+
+    with st.expander("🛠️ Ver Payload da API (Para n8n)"):
+        st.json(entry.get("payload", {}))
+
+
+# ===========================================================================
+# BARRA LATERAL — controles, upload e painel de arquivos gerados
+# ===========================================================================
 with st.sidebar:
     st.header("⚙️ Controles")
+
+    modo = st.radio(
+        "Modo de execução",
+        ["Sequencial (rápido, confiável)", "Gerente (hierárquico, flexível)"],
+        help=(
+            "SEQUENCIAL: Analista → Pesquisador → Escritor → Revisor, em cascata "
+            "(mais rápido; mantém a rede de segurança que recupera o código).\n\n"
+            "GERENTE: um LLM-gerente convoca os especialistas dinamicamente "
+            "(inclui Arquiteto e Especialista em Integrações) — mais flexível, "
+            "porém bem mais lento no modelo local."
+        ),
+    )
+    usar_gerente = modo.startswith("Gerente")
+
     usar_memoria = st.toggle(
         "Usar Memória de Longo Prazo",
         value=False,
@@ -68,19 +186,24 @@ with st.sidebar:
             "saída de uma tarefa anterior parecida (contaminação)."
         ),
     )
-    st.caption("🧠 Memória: **ligada**" if usar_memoria else "💨 Memória: **desligada**")
 
-    usar_gerente = st.toggle(
-        "Modo Gerente (Hierárquico)",
-        value=False,
-        help=(
-            "Um Gerente (LLM) convoca dinamicamente os especialistas (incl. "
-            "Arquiteto e Especialista em Integrações). Mais flexível, porém "
-            "BEM mais lento no modelo local e sem a rede de segurança que "
-            "recupera o código. Desligado = pipeline sequencial confiável."
-        ),
+    timeout_job = int(
+        st.number_input(
+            "Timeout do job (segundos)",
+            min_value=60, max_value=3600, value=600, step=60,
+            help="Quanto o painel espera a agência terminar antes de desistir.",
+        )
     )
-    st.caption("👔 Gerente: **ativo**" if usar_gerente else "➡️ Modo: **sequencial**")
+
+    rag_pasta = st.text_input(
+        "Pasta p/ Busca Semântica (opcional)",
+        value="",
+        help=(
+            "Subpasta do projeto onde o Pesquisador deve fazer a busca "
+            "semântica (RAG), ex.: 'output' ou 'src/audio'. Deixe vazio para "
+            "a agência decidir. NUNCA aponte para a raiz (indexaria o .venv)."
+        ),
+    ).strip()
 
     st.divider()
     st.subheader("📎 Anexar contexto")
@@ -100,94 +223,41 @@ with st.sidebar:
             "no contexto."
         )
 
-
-def api_no_ar() -> bool:
-    """True se a API responde — evita erros crípticos se o api.py não subiu."""
-    try:
-        requests.get(f"{API_BASE}/docs", timeout=3)
-        return True
-    except requests.RequestException:
-        return False
-
-
-def rodar_agencia(payload: dict, status) -> dict:
-    """POST /agencia + polling em /status, atualizando o st.status com as
-    etapas. Devolve o dict final do job (concluído) ou levanta RuntimeError."""
-    try:
-        resp = requests.post(f"{API_BASE}/agencia", json=payload, timeout=15)
-    except requests.RequestException as erro:
-        raise RuntimeError(f"Não consegui falar com a API: {erro}") from erro
-    if resp.status_code == 503:
-        raise RuntimeError(resp.json().get("detail", "Ollama indisponível (503)."))
-    if resp.status_code != 200:
-        raise RuntimeError(f"A API respondeu HTTP {resp.status_code}: {resp.text[:200]}")
-
-    job_id = resp.json()["job_id"]
-    rotulos = {
-        "na_fila": "⏳ Na fila…",
-        "executando": "🧠 Pesquisando → redigindo → revisando…",
-    }
-    ultimo_estado = None
-    limite = time.monotonic() + TIMEOUT_JOB_S
-    while time.monotonic() < limite:
-        time.sleep(INTERVALO_POLL_S)
-        try:
-            job = requests.get(f"{API_BASE}/status/{job_id}", timeout=10).json()
-        except requests.RequestException:
-            continue  # falha transitória — tenta de novo no próximo ciclo
-        estado = job.get("status")
-        if estado != ultimo_estado:
-            status.write(rotulos.get(estado, estado))
-            ultimo_estado = estado
-        if estado == "concluido":
-            return job
-        if estado == "erro":
-            raise RuntimeError(job.get("detalhe", "A equipe falhou sem detalhe."))
-    raise RuntimeError(f"O job passou de {TIMEOUT_JOB_S}s sem concluir.")
-
-
-def render_resposta(idx: int, entry: dict) -> None:
-    """Desenha a resposta do assistente: (2) abas Análise/Código, (5) markdown
-    com highlighting, (3) botão de download e (6) expander do payload n8n.
-    Chamado tanto ao vivo quanto ao redesenhar o histórico — por isso a
-    'key' do download é indexada (widgets repetidos precisam de key única).
-
-    'conteudo' já vem do back-end COM as crases de markdown (```lang) quando é
-    código, então basta injetá-lo via st.markdown — o Streamlit colore sozinho.
-    O download usa 'conteudo_limpo' (cru, sem crases = arquivo executável)."""
-    tipo = entry.get("tipo", "analise")
-    conteudo = entry.get("conteudo", "")
-
-    aba_chat, aba_codigo = st.tabs(["💬 Análise", "💻 Código Gerado"])
-    with aba_chat:
-        if tipo == "analise":
-            st.markdown(conteudo)  # (5) prosa/markdown renderizada
-        else:
-            st.markdown("_A resposta é código — veja a aba **💻 Código Gerado**._")
-    with aba_codigo:
-        if tipo == "codigo":
-            st.markdown(conteudo)  # (5) já vem cercado com ```lang → colorido
-        else:
-            st.markdown("_Nenhum código gerado nesta resposta._")
-
-    # (3) Download em vez do caminho cru: baixa o conteúdo LIMPO (== arquivo)
-    nome = entry.get("arquivo_nome")
-    if nome:
-        ext = os.path.splitext(nome)[1].lower()
-        st.download_button(
-            f"⬇️ Baixar {nome}",
-            data=entry.get("conteudo_limpo", conteudo),
-            file_name=nome,
-            mime=_MIME.get(ext, "text/plain"),
-            key=f"dl_{idx}",
+    st.divider()
+    st.subheader("📂 Arquivos gerados")
+    gerados = listar_gerados()
+    if not gerados:
+        st.caption("Nada gerado ainda — os resultados aparecem aqui.")
+    else:
+        escolhido = st.selectbox(
+            "Ver arquivo (output/)", [p.name for p in gerados], key="sel_gerado"
         )
+        caminho = OUTPUT_DIR / escolhido
+        try:
+            texto_arq = caminho.read_text(encoding="utf-8", errors="replace")
+        except OSError as erro:
+            texto_arq = f"(não consegui ler: {erro})"
+        ext = caminho.suffix.lower()
+        st.download_button(
+            f"⬇️ Baixar {escolhido}",
+            data=texto_arq,
+            file_name=escolhido,
+            mime=_MIME.get(ext, "text/plain"),
+            key="dl_gerado",
+        )
+        st.code(texto_arq[:2000], language=_LINGUAGEM.get(ext))
 
-    # (6) Inspecionador "n8n Ready": o payload exato que o ui.py enviou
-    with st.expander("🛠️ Ver Payload da API (Para n8n)"):
-        st.json(entry.get("payload", {}))
+    st.divider()
+    st.caption(
+        "**Equipe (sequencial):** Analista de Requisitos → Pesquisador-Curador "
+        "(busca web + leitura + RAG) → Escritor → Revisor. No modo Gerente, o "
+        "LLM-gerente também pode convocar Arquiteto e Especialista em Integrações."
+    )
 
 
-# --- Estado do chat (persiste entre interações da mesma sessão) ---
+# ===========================================================================
+# ÁREA PRINCIPAL — chat
+# ===========================================================================
 if "historico" not in st.session_state:
     st.session_state.historico = []  # dicts {papel, texto?, conteudo?, tipo?, ...}
 
@@ -212,19 +282,26 @@ if pedido:
     with st.chat_message("user"):
         st.markdown(pedido)
 
-    # (1) memória + (upload) contexto + modo gerente (hierárquico)
+    # Se o usuário indicou uma subpasta p/ RAG, injeta uma dica no pedido
+    # (sem verbo de criação nem extensão — não afeta o roteamento de arquivo).
+    tema = pedido
+    if rag_pasta:
+        tema += (
+            f"\n\n(Para buscar em arquivos, use a 'Busca Semântica na Pasta' "
+            f"apontando para: {rag_pasta})"
+        )
+
     payload = {
-        "tema": pedido,
+        "tema": tema,
         "usar_memoria": usar_memoria,
         "contexto_extra": contexto_extra,
         "usar_gerente": usar_gerente,
     }
 
     with st.chat_message("assistant"):
-        # (4) st.status no lugar do spinner, com etapas
         with st.status("Agência trabalhando…", expanded=True) as status:
             try:
-                job = rodar_agencia(payload, status)
+                job = rodar_agencia(payload, status, timeout_job)
                 entry = {
                     "papel": "assistant",
                     "conteudo": job.get("conteudo", "(sem conteúdo)"),  # COM crases
