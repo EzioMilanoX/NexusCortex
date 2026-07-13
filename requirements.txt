@@ -35,3 +35,7 @@ uvicorn[standard]>=0.30,<1.0
 # direto do projeto.
 streamlit>=1.40,<2.0
 requests>=2.32,<3.0
+
+# Testes (dev). Rode com:  pytest
+# A suíte é hermética (não exige Ollama/rede): mocka a crew e a rede.
+pytest>=8.0,<10.0
