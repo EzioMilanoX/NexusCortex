@@ -4,6 +4,9 @@ Servidor local de múltiplos agentes de IA — 100% gratuito, 100% offline —
 construído com [CrewAI](https://docs.crewai.com) (orquestração) e
 [Ollama](https://ollama.com) (inferência local do LLM).
 
+> 📖 **Novo por aqui?** Vá direto ao [TUTORIAL.md](TUTORIAL.md) — guia
+> passo a passo de instalação e dos jeitos de usar. Rode os testes com `pytest`.
+
 **Equipe atual:** `Pesquisador e Coletor de Dados` (busca web via `ddgs` +
 leitura de disco) → `Especialista em Resolução` (escreve código/prosa e tem
 terminal sandboxed) → `Engenheiro de Qualidade`, gerando o arquivo final em
