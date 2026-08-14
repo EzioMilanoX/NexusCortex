@@ -15,7 +15,10 @@ n8n (`python api.py`).
 
 **Capacidades por nível:** (1) lê pastas/arquivos locais; (2) memória de
 longo prazo via ChromaDB + embeddings locais; (3) API FastAPI; (4) API
-assíncrona (não trava o n8n) + agente com terminal sandboxed.
+assíncrona (não trava o n8n) + agente com terminal sandboxed; (5) painel
+Streamlit + endpoint OpenAI-compatível; (6) **Estúdio de Podcast** — a mesma
+equipe escreve o roteiro, duas vozes pt-BR o narram e o programa é montado em
+MP3, tudo offline (`http://localhost:8000/estudio`).
 
 ## Arquitetura e decisões de projeto
 
@@ -59,6 +62,44 @@ assíncrona (não trava o n8n) + agente com terminal sandboxed.
   `crewai-tools` foram descartadas de propósito: todas exigem chave de
   API (a única busca gratuita embutida, `ArxivPaperTool`, cobre apenas
   artigos do arXiv).
+- **A busca LÊ as páginas sozinha (`busca_web` + `_ler_fontes`):** antes ela
+  devolvia só título, link e um resumo curto — o agente nunca via o TEXTO de
+  nada. Diagnosticado num caso real: um pedido de podcast sobre "teoria dos
+  jogos" recebeu da busca três vídeos do YouTube, e o modelo, sem nada em que
+  se apoiar, escreveu de memória — definiu equilíbrio de Nash ao contrário e
+  inventou exemplos. **Não era limite do 7B, era falta de acesso ao conteúdo.**
+
+  A primeira tentativa foi dar ao Pesquisador uma ferramenta `ler_pagina_web`
+  e instruí-lo, em maiúsculas, a usá-la depois de buscar. **Não funcionou:** o
+  log de um teste completo registrou UMA execução de ferramenta
+  (`busca_na_web`) e nenhuma leitura — o qwen 7B simplesmente não a chamava, a
+  mesma limitação já documentada do terminal, que o Escritor também ignora.
+  Enquanto a leitura era uma *decisão do modelo*, ela não acontecia.
+
+  A correção foi **fundir busca e leitura numa ferramenta só**: a `busca_web`
+  ordena os resultados por credibilidade (enciclopédia e domínio institucional
+  antes de blog), descarta o que não tem prosa (vídeo, rede social, PDF), abre
+  as duas melhores e devolve o texto delas junto dos resultados. A decisão
+  deixa de existir — o agente pede uma busca e recebe prosa, queira ou não.
+  Mesma escolha de projeto do `escolher_saida` e do `parse_roteiro`: passo
+  essencial mora no código, não na obediência do modelo. A `ler_pagina_web`
+  continua disponível para conferir uma página específica.
+- **Invólucro do raspador (`_enxugar_pagina`):** o motor é a
+  `ScrapeWebsiteTool` do `crewai-tools`, gratuita e **sem chave** (é scraper,
+  não busca), mas crua ela devolve o menu de navegação e não tem teto de
+  tamanho. O filtro é **pontuação de fim de frase**, não tamanho de linha — a
+  primeira versão filtrava linhas curtas e deixava passar o pior lixo, porque
+  o scraper junta o menu inteiro numa linha longa e a lista de idiomas da
+  Wikipédia noutra. Na Wikipédia isso corta 72% e o que sobra é prosa. Efeito
+  desejado: página de vídeo não tem uma frase, então a ferramenta avisa que
+  não há texto legível em vez de entregar "About Press Copyright" como fonte.
+- **Sandbox de URL (`_url_segura`):** só `http`/`https`, e o host é resolvido
+  para recusar loopback, rede privada, link-local e multicast. Não é enfeite:
+  o Pesquisador processa texto **não confiável** da web aberta, então uma
+  injeção de prompt poderia (a) usar `file:///C:/...` para contornar o
+  confinamento a `BASE_DIR` das ferramentas de disco, ou (b) fazer SSRF contra
+  `localhost:11434` (o Ollama) e a própria API do Cortexus, que roda sem
+  autenticação.
 - **Busca semântica local (RAG):** o Pesquisador tem a `DirectorySearchTool`
   para achar trechos relevantes em arquivos grandes/base de código sem ler
   tudo (o que estouraria o contexto de 8k). Usa os embeddings **locais**
@@ -79,15 +120,22 @@ assíncrona (não trava o n8n) + agente com terminal sandboxed.
 ```
 NexusCortex(NCX)/
 ├── main.py            # a agência: agentes, tarefas, ferramentas, orquestração
-├── api.py             # API HTTP: /agencia (n8n) + /v1 OpenAI-compat (editores)
+├── api.py             # API HTTP: /agencia (n8n), /podcast, /v1 OpenAI-compat
+├── podcast.py         # Estúdio de Podcast: roteiro -> vozes -> programa final
 ├── ui.py              # painel visual em Streamlit (conversa com a api.py)
-├── cortexus.bat       # launcher de um clique (Windows)
-├── cortexus.sh        # launcher de um clique (Linux Mint)
+├── web/estudio.html   # painel do Estúdio de Podcast (servido em /estudio)
+├── cortexus.bat       # launcher de um clique: API + painel (Windows)
+├── cortexus.sh        # launcher de um clique: API + painel (Linux Mint)
+├── estudio.bat        # launcher só do Estúdio de Podcast (Windows)
+├── estudio.sh         # launcher só do Estúdio de Podcast (Linux Mint)
 ├── .streamlit/        # config do painel (desliga telemetria/prompt de e-mail)
 ├── Modelfile          # variante llama3.1-8k (legado)
 ├── Modelfile.qwen     # variante qwen2.5-8k (num_ctx 8192) — modelo atual
 ├── requirements.txt   # dependências Python
+├── tests/             # suíte pytest (hermética; `pytest` não exige Ollama)
+├── vozes/             # modelos .onnx do Piper (ignorado pelo git, ~63 MB cada)
 ├── output/            # arquivos gerados (ignorado pelo git)
+│   └── podcast/       # episódios: programa.wav, programa.mp3, roteiro.json
 ├── .gitignore
 └── README.md
 ```
@@ -210,6 +258,14 @@ o `.venv` criado.
 > $sc.TargetPath = "$PWD\cortexus.bat"; $sc.WorkingDirectory = "$PWD"
 > $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"; $sc.Save()
 > ```
+>
+> E um atalho só para o **Estúdio de Podcast** (mesma receita, outro alvo):
+> ```powershell
+> $ws = New-Object -ComObject WScript.Shell
+> $sc = $ws.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Cortexus Estudio.lnk")
+> $sc.TargetPath = "$PWD\estudio.bat"; $sc.WorkingDirectory = "$PWD"
+> $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,138"; $sc.Save()
+> ```
 
 ### Painel visual (Streamlit) — manualmente
 
@@ -225,6 +281,99 @@ separam a análise (prosa) do código gerado (com syntax highlighting);
 **botão de download** do arquivo; feedback de progresso via `st.status`; e
 um expander **"Ver Payload da API (Para n8n)"** com o JSON exato enviado —
 pronto para colar num nó do n8n.
+
+### Estúdio de Podcast (`/estudio`)
+
+**O jeito fácil:** duplo-clique em **`estudio.bat`** (Windows) ou
+`./estudio.sh` (Linux Mint) — sobe a API e abre a página sozinho. Ele não
+carrega o Streamlit, então é mais leve e rápido que o `cortexus.bat`. Se o
+painel da agência já estiver no ar, a página também está: é a **mesma API**
+que serve as duas, e há um botão para ela na barra lateral do painel.
+
+Manualmente: com a `api.py` rodando, abra **<http://localhost:8000/estudio>**.
+
+A mesma equipe que escreve relatórios escreve o roteiro; duas vozes pt-BR o
+narram; o programa sai montado em MP3. Tudo offline.
+
+O fluxo é deliberadamente em **duas etapas**: “Escrever roteiro com a IA”
+devolve o texto para você **editar na tela**, e só o segundo botão gasta os
+minutos de síntese. A crew erra o tom de vez em quando e refazer texto é
+grátis — refazer áudio não é. Você também pode pular a primeira etapa e colar
+um roteiro pronto: **esse caminho não precisa do Ollama**.
+
+```bash
+# 1. Instalar as vozes pt-BR (uma vez, ~126 MB)
+python -m piper.download_voices pt_BR-faber-medium pt_BR-cadu-medium \
+       --download-dir vozes
+
+# 2. Usar pelo terminal, sem servidor nenhum
+python podcast.py roteiro.txt --motor piper --titulo "Episódio 1"
+python podcast.py roteiro.txt --motor tom      # demonstração, sem baixar voz
+```
+
+**Decisões de projeto (medidas nesta máquina, não copiadas da documentação):**
+
+- **Piper, e não Bark/XTTS/Tortoise.** O `qwen2.5-8k` já ocupa ~5 dos 8 GB da
+  RTX 4060 (medido com `ollama ps`: `100% GPU`); os modelos de voz “pesados”
+  pedem outros 2-8 GB e **não cabem junto** — seria preciso descarregar o
+  Ollama a cada episódio, ou aceitar o TTS na CPU a passo de tartaruga. O
+  Piper roda em ONNX **na CPU**, sem tocar na VRAM, e o `onnxruntime` já vinha
+  instalado como dependência do chromadb. Medido de ponta a ponta com as vozes
+  padrão (síntese + EQ + mixagem + encode MP3): **2 min 17 s de episódio em
+  96 s**, ~1,4× mais rápido que tempo real. Vozes de qualidade `low` chegam a
+  4×, mas veja o item seguinte antes de trocar por elas.
+- **Vozes pt-BR: use `faber` + `cadu`.** O catálogo tem quatro, e a
+  `pt_BR-edresson-low` foi publicada **sem o til combinante (U+0303) no
+  `phoneme_id_map`** — ela emite `Missing phoneme from id map` e come a
+  nasalização (“não” vira “nao”). Verificado nos quatro arquivos `.onnx.json`.
+  As outras três nasalizam corretamente. A dupla padrão é `faber` (F0 ≈ 165 Hz)
+  + `cadu` (F0 ≈ 138 Hz), o par de maior distância de timbre disponível — as
+  quatro vozes são masculinas, não há voz feminina pt-BR no Piper hoje.
+- **Escrita em blocos, não num pedido só.** Pedir "cerca de 40 falas, ~750
+  palavras" rendeu **11 falas** (medido, alvo de 5 minutos). Modelo pequeno não
+  sustenta pedido longo, insistir no prompt não conserta e pedir em loop traz
+  de volta a repetição literal. Então trocamos UM pedido grande por N pequenos,
+  orquestrados em Python: a crew pesquisa e devolve uma **pauta** (blocos +
+  fatos verificados com fonte); depois **um passe curto por bloco** pede só
+  ~13 falas sobre aquele tópico. A pesquisa roda uma vez e alimenta todos os
+  blocos; os blocos são chamadas diretas (`llm.call`), sem crew, porque não
+  precisam de ferramenta nenhuma. A costura é determinística (concatenar →
+  `parse_roteiro` → `_remover_repeticoes`), cada bloco recebe as duas últimas
+  falas para não recomeçar com "Olá, bem-vindos!" no meio, e um bloco que
+  estoura não derruba o episódio. De brinde, o estúdio mostra "bloco 3 de 5"
+  em vez de uma barra parada. O modo antigo continua disponível em
+  `{"modo": "unico"}`.
+- **JSON gerado por código, nunca pelo modelo.** O roteiro é pedido no formato
+  `Nome: texto` (que qualquer modelo acerta) e convertido em Python por
+  `parse_roteiro`. Um roteiro de 15 minutos tem ~80 falas: pedir JSON ao qwen
+  7B no caminho ReAct significaria perder o job inteiro por uma vírgula. O
+  `roteiro.json` continua existindo — ele nasce das dataclasses já validadas,
+  então é sempre bem formado. O parser sobrevive a cerca de markdown,
+  `Final Answer:`, rubricas `(risos)` e até a um JSON que o modelo mande por
+  conta própria.
+- **Mixagem em numpy + `wave` da stdlib, não pydub.** O pydub depende do
+  módulo `audioop`, **removido no Python 3.13** (PEP 594), e arrastaria o
+  FFmpeg como dependência obrigatória. Aqui o FFmpeg é **opcional** e só faz o
+  encode final em MP3 — sem ele, o episódio sai em WAV normalmente.
+- **Pós-produção:** EQ de voz por fala (passa-alta em 85 Hz + realce de
+  presença em 3 kHz, via FFT), fade de 8 ms em cada emenda para não estalar,
+  pausa maior quando **troca** de apresentador, trilha em loop que entra alta
+  na abertura e **abaixa por crossfade** sob a fala, e normalização de pico.
+
+**Endpoints** (todos reaproveitam o registro de jobs e o `GET /status/{id}`):
+
+| Rota | O que faz |
+|---|---|
+| `POST /podcast/roteiro` | só escreve o roteiro (exige Ollama) |
+| `POST /podcast` | `{"roteiro": ...}` ou `{"tema": ...}` → episódio |
+| `GET /podcast/{job_id}/audio` | o MP3 (ou WAV) pronto |
+| `GET /podcast/vozes` | catálogo pt-BR e quais estão em disco |
+| `GET /podcast/ambiente` | diagnóstico de Ollama e FFmpeg |
+
+> **Trilha de fundo:** passe o caminho de um `.wav` **dentro da pasta do
+> projeto**. Caminhos fora dela são recusados de propósito — a API escuta em
+> `0.0.0.0` sem autenticação, e um caminho arbitrário no corpo do POST não
+> pode virar leitura de qualquer arquivo do disco.
 
 ### Dentro do VS Code (Continue.dev / Cline) — endpoint OpenAI-compatível
 
@@ -291,6 +440,43 @@ Confirmação cruzada:
       para Continue.dev / Cline dentro do VS Code (Nível 5).
 - [x] Agente com terminal sandboxed (Nível 4).
 - [x] Troca do modelo para `qwen2.5` (Nível 4).
+- [x] Estúdio de Podcast (Nível 6): `podcast.py` + `/estudio`, com roteiro
+      editável antes da síntese, vozes pt-BR do Piper na CPU e pós-produção
+      (EQ, pausas, trilha com duck, MP3).
+- [ ] Trilha de fundo pronta no repo: hoje é preciso apontar um `.wav` seu.
+      Falta escolher uma faixa com licença livre para embarcar.
+- [x] Duração e tamanho de fala: resolvido pela escrita em blocos. Medido no
+      mesmo tema ("teoria dos jogos", alvo de 5 min): **11 → 45 falas** e
+      **250 → 125 caracteres** por fala (não são mais monólogos de 15 s).
+- [x] Alucinação factual: resolvida pela busca que lê as fontes. No mesmo
+      tema, o roteiro passou a citar von Neumann, Morgenstern, o livro de 1944,
+      o teorema minimax e a carta de Waldegrave de 1713 — tudo rastreável à
+      pauta. Antes: equilíbrio de Nash definido ao contrário e exemplos
+      inventados ("jogo do lembretista").
+- [x] **Qualidade das fontes.** Agregadores sem revisão (`prezi`, `slideshare`,
+      `scribd`, `quora`…) nunca são lidos; o resto é lido em ordem de
+      credibilidade e **rotulado** como `[FONTE DE REFERÊNCIA]` (enciclopédia,
+      `.gov`, `.edu`, documentação) ou `[FONTE SECUNDÁRIA]`, com a regra de que
+      datas, nomes e definições saem da primeira. Motivo: o único erro factual
+      que sobreviveu ao teste ("equilíbrio de Nash formulado no início do
+      século XX"; foi 1950-51) veio de um blog de consultoria lido lado a lado
+      com a Wikipédia — o modelo não tinha como saber qual das duas pesava
+      mais. Sem fonte de referência entre os resultados, o bloco avisa que os
+      números são incertos.
+- [x] **Calibração de duração.** O modelo entrega ~15% mais falas do que se
+      pede (medido: 51, 44 e 45 contra 39 pedidas), então o pedido sai
+      multiplicado por `CALIBRACAO_FALAS = 0.85` e o ritmo real das vozes foi
+      medido em 143 palavras/minuto (era estimado em 150). Calibração empírica
+      de três amostras — trocando de modelo, meça de novo.
+- [x] **Emenda entre blocos.** Só o último bloco fecha o episódio; os demais
+      são proibidos de usar frase de gancho ou anunciar o que vem a seguir, e
+      terminam no meio do assunto.
+- [ ] O modelo copia o rótulo do exemplo da pauta como título do bloco
+      ("1. O que é e de onde veio | definição exata..."). Inofensivo desde que
+      `dividir_pauta` anexe os fatos da linha seguinte, mas é cosmética suja.
+- [ ] Voz feminina em pt-BR: não existe no catálogo do Piper. Depende de
+      avaliar o XTTS-v2 (VRAM disputada com o qwen + licença CPML
+      não-comercial) ou treinar uma voz.
 - [ ] Autenticação (token) na API se for exposta além do `127.0.0.1`.
 - [ ] O agente Escritor nem sempre aciona o terminal para auto-testar o
       código (limitação do modelo 7B) — avaliar um passo de verificação

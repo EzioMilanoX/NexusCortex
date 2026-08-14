@@ -36,7 +36,7 @@ Detalhes e solução de problemas: seção "Setup do ambiente" do README.
 
 ---
 
-## 2. Os quatro jeitos de usar
+## 2. Os cinco jeitos de usar
 
 ### 2.1. Terminal (o mais direto)
 
@@ -104,7 +104,67 @@ Cada mensagem roda a crew inteira (minutos) — aumente o timeout da extensão.
 É fachada de **chat/análise**; o modo *Agente* (tool-use nativo) não passa
 por aqui. **Cursor não funciona** com localhost (faz proxy pela nuvem).
 
-### 2.5. Ponte para outro orquestrador (nexus_bridge.py)
+### 2.5. Estúdio de Podcast (`/estudio`)
+
+Transforma um tema (ou um roteiro seu) em um episódio narrado por duas vozes.
+
+**Instalar as vozes, uma vez (~126 MB):**
+```bash
+python -m piper.download_voices pt_BR-faber-medium pt_BR-cadu-medium \
+       --download-dir vozes
+```
+
+**Abrir (o jeito fácil):** duplo-clique em **`estudio.bat`** (Windows) ou
+`./estudio.sh` (Linux Mint). Ele sobe a API e abre a página sozinho — não
+carrega o Streamlit, então é mais leve que o `cortexus.bat`.
+
+Se você já está com o painel da agência aberto, o estúdio **já está no ar**
+(é a mesma API): use o botão **🎙️ Abrir o Estúdio de Podcast** na barra
+lateral, ou vá direto em <http://localhost:8000/estudio>.
+
+Na mão: `python api.py` e abra <http://localhost:8000/estudio>.
+
+1. Escreva o **tema**, escolha a duração e clique em **“Escrever roteiro com
+   a IA”** — a equipe leva alguns minutos.
+2. O roteiro cai num editor. **Corrija à mão**: é aqui que você conserta o
+   que o 7B errou. Editar texto é grátis; refazer o áudio custa minutos.
+3. Clique em **“Gerar episódio”**. O player aparece com o MP3 e a transcrição.
+
+**Modo de escrita** (na coluna da esquerda):
+
+- **Em blocos** (padrão) — a equipe primeiro pesquisa na web, **lê** a melhor
+  fonte e monta uma pauta; depois escreve um trecho por vez. É mais lento e é
+  o que faz o episódio chegar perto da duração pedida: no passe único, um
+  alvo de 5 minutos rendia 11 falas.
+- **Passe único** — um pedido só. Mais rápido, roteiro bem mais curto.
+
+**A dica que mais melhora o resultado:** cole um texto de referência em
+**“Material de base”**. Com ele, os fatos saem *desse* texto em vez da memória
+do modelo — é a defesa mais forte contra definição errada e exemplo inventado.
+
+> **Não precisa do Ollama** se você colar um roteiro pronto no editor e pular
+> direto para o passo 3. Só a escrita do roteiro depende do modelo de chat.
+
+**Pelo terminal, sem servidor nenhum:**
+```bash
+python podcast.py roteiro.txt --motor piper --titulo "Episódio 1"
+python podcast.py roteiro.txt --motor tom       # demonstração, sem baixar voz
+python podcast.py roteiro.txt --trilha web/trilha.wav
+```
+
+**Formato do roteiro** — uma linha por fala:
+```
+Host1: Bem-vindo ao episódio de hoje.
+Host2: E o assunto é bom.
+```
+O parser é tolerante: aceita `**Ana:**`, `[Bruno]`, `- ANA — `, junta linhas
+quebradas na fala anterior, e descarta títulos, `Tema:`, rubricas `(risos)` e
+o `Final Answer:` que o CrewAI às vezes vaza.
+
+**Motor `tom`:** gera bipes em vez de voz, com a duração de cada fala. Serve
+para conferir a montagem (pausas, trilha, crossfade) sem baixar modelo nenhum.
+
+### 2.6. Ponte para outro orquestrador (nexus_bridge.py)
 
 Se você tem OUTRO agente (ex.: Roo Code) e quer que ele consulte a Cortexus
 pontualmente, sem apontar o modelo dele para a `:8000` (evita loop
@@ -165,3 +225,55 @@ Qwen em si — isso é avaliação manual, não teste automatizado.
 - **Resposta repetida/estranha** → desligue a Memória (contaminação do 7B).
 - **Sem cores no código do painel** → confira que a extensão do arquivo é
   reconhecida (`.py/.sh/.js/...`); `.md`/`.txt` são tratados como prosa.
+
+### Estúdio de Podcast
+
+- **"Voz do Piper não encontrada"** → rode o `download_voices` da seção 2.5.
+  O erro já traz o comando exato, com a pasta certa.
+- **"Não encontrei nenhuma fala no roteiro"** → o texto não tem o formato
+  `Nome: texto` em nenhuma linha. Acontece quando o 7B ignora o formato e
+  devolve prosa corrida; peça de novo ou escreva as falas à mão.
+- **`Missing phoneme from id map: ̃`** → você escolheu a voz
+  **`pt_BR-edresson-low`**, que foi publicada sem o til nasal e engole o "ã"
+  ("não" sai "nao"). Use `faber`, `cadu` ou `jeff`.
+- **Sai WAV em vez de MP3** → falta o FFmpeg no PATH. É opcional; para ter o
+  MP3: `winget install Gyan.FFmpeg` (Windows) ou `sudo apt install ffmpeg`.
+- **As duas vozes soam parecidas** → o catálogo pt-BR do Piper é todo
+  masculino. O par de maior contraste é `faber` (mais agudo) + `cadu` (mais
+  grave); `jeff` fica no meio.
+- **Quanto tempo leva?** Com a GPU liberada: a equipe escreve um roteiro de 20
+  falas em ~2,5 min, e a síntese + montagem de 2 min 17 s de áudio leva
+  ~1,5 min. Não tente mandar o Piper para a GPU: ela está ocupada pelo modelo
+  de chat, e na CPU ele já roda mais rápido que tempo real.
+
+- **A escrita do roteiro levou UMA HORA em vez de minutos.** Não é a agência:
+  é a GPU sendo impedida de subir o clock. Aconteceu de verdade num teste —
+  a mesma crew que leva 2,5 min levou 62 min. Diagnóstico em um comando:
+
+  ```powershell
+  nvidia-smi --query-gpu=utilization.gpu,clocks.current.graphics,clocks.max.graphics,power.draw,pstate --format=csv
+  ```
+
+  Se aparecer **`utilization=100%` junto de `pstate=P8` e o clock atual em
+  ~210 MHz** (contra ~3105 MHz de máximo) e uns 5 W de consumo, a placa está
+  trabalhando no clock de repouso — ~4% do desempenho. Medindo a geração:
+
+  ```powershell
+  $b='{"model":"qwen2.5-8k","prompt":"Escreva um paragrafo.","stream":false}'
+  $r=Invoke-RestMethod http://localhost:11434/api/generate -Method Post -Body $b -ContentType application/json
+  [math]::Round($r.eval_count/($r.eval_duration/1e9),1)   # tok/s
+  ```
+
+  Saudável nesta máquina é **~39 tok/s em P0** (clock 1110 MHz); o sintoma é
+  **1,7 tok/s em P8** — 23× mais lento. O sinal que importa é o **pstate**,
+  não a utilização: 100% de uso em P8 significa "trabalhando no clock de
+  repouso".
+
+  **O estado se resolveu sozinho** entre dois testes, sem nada ter sido
+  fechado — então é uma condição transitória do driver/energia, não um app
+  específico. (Roblox e o Epic Games Launcher estavam abertos nas DUAS
+  medições, a lenta e a rápida; não eram a causa.) Se acontecer: espere um
+  pouco e meça de novo; se persistir, verifique o Modo de Energia do Windows
+  em *Melhor desempenho* e, no **Painel de Controle da NVIDIA → Gerenciar
+  configurações 3D → Modo de gerenciamento de energia**, escolha "Preferir
+  desempenho máximo".

@@ -36,6 +36,24 @@ uvicorn[standard]>=0.30,<1.0
 streamlit>=1.40,<2.0
 requests>=2.32,<3.0
 
+# Estúdio de Podcast (podcast.py).
+#
+# numpy: já vem como dependência transitiva do chromadb, mas o podcast.py o
+# importa DIRETAMENTE (toda a mixagem é numpy), então fica declarado.
+#
+# piper-tts: motor de voz. Escolhido por rodar em ONNX na CPU — Bark/XTTS/
+# Tortoise disputariam a VRAM com o qwen2.5, que já ocupa ~6 dos 8 GB da RTX
+# 4060. Custo em disco: o pacote é pequeno e reaproveita o onnxruntime que o
+# chromadb já traz; as VOZES (~63 MB cada) são baixadas à parte, sob demanda:
+#   python -m piper.download_voices pt_BR-faber-medium pt_BR-cadu-medium --download-dir vozes
+# Sem ele o estúdio ainda funciona com o motor 'tom' (demonstração).
+#
+# NÃO usamos pydub: ele depende do módulo 'audioop', removido no Python 3.13
+# (PEP 594), e exigiria o FFmpeg no PATH. Aqui o FFmpeg é OPCIONAL e só serve
+# para o encode final em MP3 — sem ele o episódio sai em WAV.
+numpy>=1.26,<3.0
+piper-tts>=1.3,<2.0
+
 # Testes (dev). Rode com:  pytest
 # A suíte é hermética (não exige Ollama/rede): mocka a crew e a rede.
 pytest>=8.0,<10.0

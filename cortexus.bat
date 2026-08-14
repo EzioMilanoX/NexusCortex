@@ -38,6 +38,9 @@ echo [Cortexus] Tudo no ar! Abrindo o navegador...
 start "" http://localhost:8501
 
 echo.
+echo [Cortexus] Estudio de Podcast: http://localhost:8000/estudio
+echo            ^(ja esta no ar - a API acima o serve; ou use estudio.bat^)
+echo.
 echo [Cortexus] Abriram duas janelas: "Cortexus API" e "Cortexus Painel".
 echo            Feche as duas para desligar o servidor. Pode fechar ESTA janela.
 pause

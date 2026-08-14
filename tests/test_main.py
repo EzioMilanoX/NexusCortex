@@ -69,6 +69,299 @@ def test_conteudo_para_exibicao_codigo_tem_crases_e_prosa_nao():
 # --------------------------------------------------------------------------
 # _parece_codigo
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# ler_pagina_web — sandbox de URL e limpeza (sem rede: o raspador é mockado)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "url,trecho",
+    [
+        ("file:///C:/Windows/win.ini", "Esquema 'file' bloqueado"),
+        ("ftp://exemplo.com/x", "Esquema 'ftp' bloqueado"),
+        ("nao-e-url", "Esquema 'ausente' bloqueado"),
+        ("https://", "sem domínio"),
+    ],
+)
+def test_ler_pagina_web_recusa_esquema_nao_http(url, trecho):
+    """Sem este bloqueio, 'file:///...' usaria esta ferramenta para contornar o
+    confinamento a BASE_DIR das ferramentas de disco."""
+    saida = main.ler_pagina_web.run(url=url)
+    assert saida.startswith("BLOQUEADO") and trecho in saida
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:11434/api/tags",   # o próprio Ollama
+        "http://127.0.0.1:8000/status/x",    # a própria API do Cortexus
+        "http://192.168.0.1/admin",          # roteador da rede doméstica
+        "http://10.0.0.5/",
+        "http://169.254.169.254/latest/meta-data/",  # metadados de nuvem
+    ],
+)
+def test_ler_pagina_web_recusa_endereco_interno(url):
+    """SSRF: o agente processa texto NÃO confiável da web, então uma injeção
+    de prompt poderia mandá-lo buscar um endereço interno."""
+    saida = main.ler_pagina_web.run(url=url)
+    assert saida.startswith("BLOQUEADO") and "interno" in saida
+
+
+def test_ler_pagina_web_dominio_inexistente_nao_estoura(monkeypatch):
+    def _falha(*a, **k):
+        raise OSError("getaddrinfo failed")
+    monkeypatch.setattr(main.socket, "getaddrinfo", _falha)
+    saida = main.ler_pagina_web.run(url="https://dominio-que-nao-existe.invalid/x")
+    assert "resolver o domínio" in saida
+
+
+# --------------------------------------------------------------------------
+# busca_web — agora LÊ as fontes sozinha (rede mockada)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "url,esperado",
+    [
+        ("https://pt.wikipedia.org/wiki/X", True),
+        ("https://docs.python.org/3/", True),
+        ("https://blog.aleatorio.com/post", True),
+        ("https://www.youtube.com/watch?v=abc", False),   # vídeo: sem prosa
+        ("https://www.instagram.com/p/abc", False),
+        ("https://exemplo.com/manual.pdf", False),
+        ("ftp://exemplo.com/x", False),
+    ],
+)
+def test_vale_ler_descarta_video_e_binario(url, esperado):
+    assert main._vale_ler(url) is esperado
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://prezi.com/p/abc/teoria",
+        "https://pt.slideshare.net/x",
+        "https://www.scribd.com/doc/1",
+        "https://brainly.com.br/tarefa/1",
+        "https://pt.quora.com/x",
+    ],
+)
+def test_vale_ler_descarta_agregador_de_slides_e_respostas(url):
+    """Têm prosa, mas prosa sem revisão. Um deles (`prezi.com`) chegou a virar
+    fonte citada numa pauta de teste."""
+    assert main._vale_ler(url) is False
+
+
+@pytest.mark.parametrize(
+    "url,referencia",
+    [
+        ("https://pt.wikipedia.org/wiki/X", True),
+        ("https://plato.stanford.edu/entries/game-theory/", True),
+        ("https://www.gov.br/pagina", True),
+        ("https://docs.python.org/3/", True),
+        ("https://www.fm2s.com.br/blog/teoria-dos-jogos", False),
+        ("https://scopi.com.br/blog/x", False),
+    ],
+)
+def test_eh_referencia_separa_enciclopedia_de_blog(url, referencia):
+    assert main._eh_referencia(url) is referencia
+
+
+def test_busca_web_rotula_o_nivel_de_cada_fonte(monkeypatch, raspador):
+    """O único erro factual que sobreviveu num teste real veio de um blog de
+    consultoria lido junto da Wikipédia — o modelo não tinha como saber qual
+    das duas pesava mais."""
+    resultados = [
+        {"title": "Blog", "href": "https://www.fm2s.com.br/blog/x", "body": ".."},
+        {"title": "Wiki", "href": "https://pt.wikipedia.org/wiki/X", "body": ".."},
+    ]
+    monkeypatch.setattr(
+        main, "DDGS", lambda: type("D", (), {"text": lambda s, *a, **k: resultados})()
+    )
+    raspador("Uma frase de conteudo com tamanho suficiente para ser mantida.\n")
+
+    saida = main.busca_web.run(query="x")
+    assert "[FONTE DE REFERÊNCIA] TEXTO DE https://pt.wikipedia.org" in saida
+    assert "[FONTE SECUNDÁRIA] TEXTO DE https://www.fm2s.com.br" in saida
+    assert "DATAS, NOMES PRÓPRIOS e DEFINIÇÕES" in saida
+    # A de referência é lida primeiro (ordenação por credibilidade).
+    assert saida.index("pt.wikipedia.org/wiki/X:") < saida.index("fm2s.com.br/blog/x:")
+
+
+def test_busca_web_avisa_quando_so_ha_fonte_secundaria(monkeypatch, raspador):
+    resultados = [{"title": "Blog", "href": "https://blog.qualquer.com/x", "body": ".."}]
+    monkeypatch.setattr(
+        main, "DDGS", lambda: type("D", (), {"text": lambda s, *a, **k: resultados})()
+    )
+    raspador("Uma frase de conteudo com tamanho suficiente para ser mantida.\n")
+    saida = main.busca_web.run(query="x")
+    assert "Nenhuma fonte de referência foi encontrada" in saida
+    assert "incertos" in saida
+
+
+def test_credibilidade_ordena_enciclopedia_antes_de_blog():
+    urls = [
+        "https://blog.qualquer.com/a",
+        "https://pt.wikipedia.org/wiki/A",
+        "https://x.edu/a",
+    ]
+    ordenado = sorted(urls, key=main._nota_de_credibilidade)
+    assert "wikipedia" in ordenado[0]
+    assert "blog" in ordenado[-1]
+
+
+def test_busca_web_anexa_o_texto_das_fontes(monkeypatch, raspador):
+    """O ponto central: MEDIMOS que o 7B não chama a ferramenta de leitura
+    (uma execução de ferramenta no log, só a busca). Fundindo busca e leitura,
+    a decisão sai das mãos do modelo — ele recebe prosa queira ou não."""
+    resultados = [
+        {"title": "Vídeo", "href": "https://www.youtube.com/watch?v=1", "body": ".."},
+        {"title": "Wiki", "href": "https://pt.wikipedia.org/wiki/Nash", "body": ".."},
+    ]
+    monkeypatch.setattr(main, "DDGS", lambda: type("D", (), {"text": lambda s, *a, **k: resultados})())
+    raspador(
+        "O equilíbrio de Nash é a situação em que nenhum jogador ganha "
+        "mudando de estratégia sozinho.\n"
+    )
+
+    saida = main.busca_web.run(query="equilibrio de nash")
+    assert "TEXTO DAS FONTES" in saida
+    assert "nenhum jogador ganha" in saida
+    # A lista de resultados continua ali; o texto é um acréscimo.
+    assert "https://pt.wikipedia.org/wiki/Nash" in saida
+    # O YouTube foi descartado antes de qualquer requisição.
+    assert "TEXTO DE https://www.youtube.com" not in saida
+
+
+def test_busca_web_avisa_quando_nenhuma_fonte_tem_texto(monkeypatch, raspador):
+    resultados = [{"title": "V", "href": "https://youtu.be/x", "body": ".."}]
+    monkeypatch.setattr(main, "DDGS", lambda: type("D", (), {"text": lambda s, *a, **k: resultados})())
+    raspador("")
+    saida = main.busca_web.run(query="x")
+    assert "NENHUMA das páginas devolveu texto legível" in saida
+    assert "NÃO invente" in saida
+
+
+def test_busca_web_respeita_o_teto_de_fontes(monkeypatch, raspador):
+    resultados = [
+        {"title": f"F{i}", "href": f"https://site{i}.org/a", "body": ".."}
+        for i in range(6)
+    ]
+    monkeypatch.setattr(main, "DDGS", lambda: type("D", (), {"text": lambda s, *a, **k: resultados})())
+    raspador("Uma frase de conteúdo com tamanho suficiente para valer. " * 3)
+    saida = main.busca_web.run(query="x")
+    assert saida.count("TEXTO DE https://") <= main.MAX_FONTES_LIDAS
+
+
+def test_busca_web_fonte_que_explode_nao_derruba_a_busca(monkeypatch, raspador):
+    resultados = [{"title": "A", "href": "https://a.org/x", "body": ".."}]
+    monkeypatch.setattr(main, "DDGS", lambda: type("D", (), {"text": lambda s, *a, **k: resultados})())
+
+    def _explode(**k):
+        raise RuntimeError("conexão caiu")
+
+    raspador(_explode)
+    saida = main.busca_web.run(query="x")
+    assert "https://a.org/x" in saida            # a lista sobrevive
+    assert "NENHUMA das páginas" in saida        # e o aviso aparece
+
+
+def test_busca_web_falha_de_rede_vira_texto(monkeypatch):
+    def _boom():
+        raise RuntimeError("sem rede")
+    monkeypatch.setattr(main, "DDGS", _boom)
+    assert "A busca falhou" in main.busca_web.run(query="x")
+
+
+class _RaspadorFalso:
+    """Substitui o `main._raspador` inteiro nos testes.
+
+    Trocar só o método `run` não funciona: a ScrapeWebsiteTool é um modelo
+    pydantic e recusa atributo que não esteja no schema ("object has no field
+    'run'"). Substituir o objeto do módulo é mais simples e não depende do
+    formato interno da ferramenta.
+    """
+
+    def __init__(self, resposta):
+        self._resposta = resposta
+
+    def run(self, **kwargs):
+        return self._resposta(**kwargs)
+
+
+@pytest.fixture
+def raspador(monkeypatch):
+    """Devolve um instalador de resposta falsa, com a URL já liberada."""
+    monkeypatch.setattr(main, "_url_segura", lambda url: None)
+
+    def instalar(resposta):
+        alvo = resposta if callable(resposta) else (lambda **k: resposta)
+        monkeypatch.setattr(main, "_raspador", _RaspadorFalso(alvo))
+
+    return instalar
+
+
+def test_ler_pagina_web_devolve_texto_limpo(raspador):
+    raspador(
+        "The following text is scraped website content:\n"
+        "Equilíbrio de Nash – Wikipédia\n"                      # título, sem ponto
+        "Página principal Conteúdo destacado Eventos atuais\n"   # menu longo
+        "العربية Azərbaycanca Български Català Čeština\n"        # lista de idiomas
+        "O equilíbrio de Nash é uma situação em que nenhum jogador ganha "
+        "mudando de estratégia unilateralmente.[1]\n"
+        "Doar\n"
+    )
+    saida = main.ler_pagina_web.run(url="https://pt.wikipedia.org/wiki/X")
+    assert "equilíbrio de Nash é uma situação" in saida
+    # O critério é pontuação de fim de frase, não tamanho: o menu longo cai.
+    assert "Página principal" not in saida
+    assert "Azərbaycanca" not in saida
+    assert "Doar" not in saida
+    assert "[1]" not in saida          # marcador de referência não se pronuncia
+    assert "scraped website content" not in saida
+
+
+def test_ler_pagina_web_avisa_quando_nao_ha_prosa(raspador):
+    """Foi o caso que gerou o roteiro alucinado: a busca devolveu vídeos do
+    YouTube, cuja página não tem uma única frase para ler."""
+    raspador("Titulo do video - YouTube About Press Copyright Contact us")
+    saida = main.ler_pagina_web.run(url="https://www.youtube.com/watch?v=abc")
+    assert "não devolveu texto legível" in saida
+
+
+def test_ler_pagina_web_trunca_no_limite(raspador):
+    raspador("Esta é uma frase de conteúdo com tamanho suficiente. " * 400)
+    saida = main.ler_pagina_web.run(url="https://exemplo.com")
+    assert "texto truncado" in saida
+    assert len(saida) < main.LIMITE_PAGINA_WEB + 300  # + cabeçalho e aviso
+
+
+def test_ler_pagina_web_erro_do_raspador_vira_texto(raspador):
+    """A ferramenta nunca levanta: o laço ReAct precisa do erro como texto
+    para tentar a próxima fonte."""
+
+    def _explode(**k):
+        raise RuntimeError("timeout")
+
+    raspador(_explode)
+    saida = main.ler_pagina_web.run(url="https://exemplo.com")
+    assert "Não consegui ler a página" in saida and "timeout" in saida
+
+
+def test_pesquisador_recebe_a_ferramenta_de_leitura(monkeypatch):
+    """Regressão: a ferramenta existir sem estar ligada ao agente seria pior
+    que não existir — o sintoma (alucinação) continuaria idêntico.
+
+    A DirectorySearchTool é substituída porque o construtor dela cria um
+    cliente/coleção ChromaDB em %LOCALAPPDATA% — efeito colateral que não cabe
+    numa suíte hermética."""
+    # Reaproveita uma ferramenta já instanciada: o Agent do CrewAI valida que
+    # `tools` contém BaseTool, então o dublê não pode ser um objeto qualquer.
+    monkeypatch.setattr(main, "DirectorySearchTool", lambda *a, **k: main.leitor_pastas)
+
+    equipe = main.montar_equipe("tema qualquer", llm=main.criar_llm())
+    pesquisador = next(a for a in equipe.agents if "Pesquisador" in a.role)
+    nomes = {getattr(t, "name", "") for t in pesquisador.tools}
+    assert "Ler Página Web" in nomes
+    assert "Busca na Web" in nomes
+
+
 def test_parece_codigo_detecta_codigo():
     assert main._parece_codigo("def f():\n    return 1") is True
     assert main._parece_codigo("#!/bin/bash\necho oi") is True

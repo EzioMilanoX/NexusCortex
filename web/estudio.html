@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cortexus — Estúdio de Podcast</title>
+<!--
+  Servido pela própria api.py em GET /estudio.
+
+  Regras que valem para este arquivo:
+  - ZERO recursos externos. O projeto inteiro é offline; uma fonte do Google
+    ou um CDN de CSS deixaria a página quebrada exatamente na máquina sem
+    internet, que é o caso de uso. Tudo aqui é inline.
+  - Nada de framework. São ~3 telas e um polling; React/Vue custaria uma
+    build e um node_modules num projeto que hoje é só Python.
+  - Mesma origem da API (localhost:8000), então o fetch não passa por CORS.
+-->
+<style>
+  /* Paleta: escura por padrão (é um estúdio), clara se o SO pedir. */
+  :root {
+    --bg: #0f1115;         --painel: #171a21;    --painel2: #1e222b;
+    --borda: #2a2f3a;      --texto: #e8eaf0;     --suave: #9aa3b4;
+    --acento: #7c9cff;     --acento2: #4ade80;   --erro: #f87171;
+    --aviso: #fbbf24;      --raio: 12px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6fa;       --painel: #ffffff;    --painel2: #eef1f7;
+      --borda: #d8deea;    --texto: #171a21;     --suave: #5b6478;
+      --acento: #3355dd;   --acento2: #17914f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--texto);
+    font: 15px/1.55 "Segoe UI", Roboto, Ubuntu, system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 16px 24px; border-bottom: 1px solid var(--borda);
+    background: var(--painel); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: var(--suave); font-size: 13px; }
+  .selos { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .selo {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--borda); background: var(--painel2); color: var(--suave);
+    white-space: nowrap;
+  }
+  .selo.ok { color: var(--acento2); border-color: color-mix(in srgb, var(--acento2) 45%, var(--borda)); }
+  .selo.off { color: var(--aviso); border-color: color-mix(in srgb, var(--aviso) 45%, var(--borda)); }
+
+  main {
+    display: grid; grid-template-columns: 340px minmax(0, 1fr);
+    gap: 20px; padding: 20px 24px 60px; max-width: 1280px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .cartao {
+    background: var(--painel); border: 1px solid var(--borda);
+    border-radius: var(--raio); padding: 18px;
+  }
+  .cartao + .cartao { margin-top: 16px; }
+  .cartao h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--suave); margin: 0 0 14px; font-weight: 650;
+  }
+  label { display: block; font-size: 13px; color: var(--suave); margin: 12px 0 5px; }
+  label:first-of-type { margin-top: 0; }
+  input, select, textarea, button {
+    font: inherit; color: var(--texto); width: 100%;
+    background: var(--painel2); border: 1px solid var(--borda);
+    border-radius: 9px; padding: 9px 11px;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: 2px solid color-mix(in srgb, var(--acento) 55%, transparent);
+    outline-offset: -1px; border-color: var(--acento);
+  }
+  textarea { resize: vertical; line-height: 1.6; }
+  .dupla { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  button {
+    cursor: pointer; font-weight: 600; border: 1px solid transparent;
+    background: var(--acento); color: #0b0d12; transition: filter .12s;
+  }
+  @media (prefers-color-scheme: light) { button { color: #fff; } }
+  button:hover:not(:disabled) { filter: brightness(1.1); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.secundario { background: var(--painel2); color: var(--texto); border-color: var(--borda); }
+
+  .editor-topo {
+    display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; flex-wrap: wrap;
+  }
+  .editor-topo h2 { margin: 0; }
+  .metricas { margin-left: auto; font-size: 12px; color: var(--suave); font-variant-numeric: tabular-nums; }
+  .dica { font-size: 12px; color: var(--suave); margin-top: 8px; }
+  code {
+    background: var(--painel2); border: 1px solid var(--borda);
+    padding: 1px 5px; border-radius: 5px; font-size: 12px;
+  }
+
+  #estado { display: none; margin-top: 16px; }
+  #estado.visivel { display: block; }
+  .barra {
+    height: 5px; border-radius: 3px; background: var(--painel2);
+    overflow: hidden; margin-top: 10px;
+  }
+  .barra i {
+    display: block; height: 100%; width: 35%; border-radius: 3px;
+    background: var(--acento); animation: corre 1.15s ease-in-out infinite;
+  }
+  @keyframes corre { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+  .linha-estado { display: flex; align-items: center; gap: 10px; }
+  .cronometro { margin-left: auto; color: var(--suave); font-variant-numeric: tabular-nums; font-size: 13px; }
+
+  .alerta {
+    border-radius: 9px; padding: 11px 13px; font-size: 13px; margin-top: 14px;
+    border: 1px solid var(--erro); background: color-mix(in srgb, var(--erro) 12%, transparent);
+    white-space: pre-wrap;
+  }
+  .alerta.aviso { border-color: var(--aviso); background: color-mix(in srgb, var(--aviso) 12%, transparent); }
+
+  audio { width: 100%; margin: 4px 0 14px; }
+  .acoes { display: flex; gap: 10px; flex-wrap: wrap; }
+  .acoes a {
+    text-decoration: none; font-size: 13px; font-weight: 600; padding: 9px 14px;
+    border: 1px solid var(--borda); border-radius: 9px;
+    background: var(--painel2); color: var(--texto);
+  }
+  .acoes a:hover { border-color: var(--acento); }
+
+  .transcricao { margin-top: 18px; border-top: 1px solid var(--borda); padding-top: 14px; }
+  .fala { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 12px; padding: 5px 0; }
+  .fala b { font-size: 12px; text-align: right; padding-top: 3px; color: var(--acento); }
+  .fala.v2 b { color: var(--acento2); }
+  .fala span { font-size: 14px; }
+  .oculto { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Cortexus &middot; Estúdio de Podcast</h1>
+    <div class="sub">Roteiro, vozes e pós-produção — tudo na sua máquina</div>
+  </div>
+  <div class="selos">
+    <span class="selo" id="selo-ollama">verificando Ollama…</span>
+    <span class="selo" id="selo-ffmpeg">verificando FFmpeg…</span>
+  </div>
+</header>
+
+<main>
+  <!-- ================= COLUNA DE CONTROLES ================= -->
+  <section>
+    <div class="cartao">
+      <h2>1 &middot; Pauta</h2>
+
+      <label for="tema">Tema do episódio</label>
+      <textarea id="tema" rows="3"
+        placeholder="Ex.: por que rodar agentes de IA localmente muda a questão da privacidade"></textarea>
+
+      <div class="dupla">
+        <div>
+          <label for="minutos">Duração alvo</label>
+          <select id="minutos">
+            <option value="2">2 minutos</option>
+            <option value="5" selected>5 minutos</option>
+            <option value="10">10 minutos</option>
+            <option value="15">15 minutos</option>
+          </select>
+        </div>
+        <div>
+          <label for="titulo">Título (opcional)</label>
+          <input id="titulo" placeholder="Episódio 1">
+        </div>
+      </div>
+
+      <label for="modo">Modo de escrita</label>
+      <select id="modo">
+        <option value="blocos" selected>Em blocos — pesquisa e respeita a duração</option>
+        <option value="unico">Passe único — mais rápido, roteiro mais curto</option>
+      </select>
+      <div class="dica">
+        Em blocos, a equipe primeiro pesquisa e monta uma pauta, depois escreve
+        um trecho por vez. Leva mais tempo e é o que faz o episódio chegar
+        perto da duração pedida.
+      </div>
+
+      <label for="contexto">Material de base (opcional)</label>
+      <textarea id="contexto" rows="3"
+        placeholder="Cole aqui o texto de um PDF, artigo ou anotação. A equipe trata isso como fonte primária."></textarea>
+      <div class="dica">
+        Com material colado aqui, os fatos saem <em>deste</em> texto em vez da
+        memória do modelo — é o jeito mais seguro de evitar invenção.
+      </div>
+
+      <button id="btn-roteiro" style="margin-top:14px">Escrever roteiro com a IA</button>
+      <div class="dica">Precisa do Ollama no ar. Sem ele, escreva ou cole o roteiro ao lado — o áudio sai do mesmo jeito.</div>
+    </div>
+
+    <div class="cartao">
+      <h2>2 &middot; Vozes e estúdio</h2>
+
+      <label for="voz1">Voz do apresentador 1</label>
+      <select id="voz1"></select>
+
+      <label for="voz2">Voz do apresentador 2</label>
+      <select id="voz2"></select>
+
+      <label for="motor">Motor de voz</label>
+      <select id="motor">
+        <option value="piper" selected>Piper — voz real (CPU, offline)</option>
+        <option value="tom">Tom — demonstração, sem baixar voz</option>
+      </select>
+
+      <label for="trilha">Trilha de fundo (opcional)</label>
+      <input id="trilha" placeholder="ex.: web/trilha.wav">
+      <div class="dica">Caminho de um <code>.wav</code> dentro da pasta do projeto. Entra alta na abertura e abaixa sob a fala.</div>
+    </div>
+  </section>
+
+  <!-- ================= COLUNA PRINCIPAL ================= -->
+  <section>
+    <div class="cartao">
+      <div class="editor-topo">
+        <h2>3 &middot; Roteiro</h2>
+        <span class="metricas" id="metricas">nenhuma fala ainda</span>
+      </div>
+
+      <textarea id="roteiro" rows="16"
+        placeholder="Host1: Uma linha por fala, no formato Nome: texto.&#10;Host2: A IA preenche isto para você, e você corrige à mão antes de gerar o áudio."></textarea>
+      <div class="dica">
+        Uma linha por fala, no formato <code>Nome: texto</code>. Editar aqui é grátis;
+        refazer o áudio custa minutos — revise antes de gerar.
+      </div>
+
+      <div class="acoes" style="margin-top:14px">
+        <button id="btn-audio" style="flex:1 1 220px">Gerar episódio</button>
+        <button id="btn-limpar" class="secundario" style="flex:0 0 auto; width:auto">Limpar</button>
+      </div>
+
+      <div id="estado">
+        <div class="linha-estado">
+          <strong id="estado-texto">Trabalhando…</strong>
+          <span class="cronometro" id="cronometro">0:00</span>
+        </div>
+        <div class="barra"><i></i></div>
+      </div>
+
+      <div id="erro" class="alerta oculto"></div>
+    </div>
+
+    <div class="cartao oculto" id="cartao-episodio">
+      <div class="editor-topo">
+        <h2>4 &middot; Episódio</h2>
+        <span class="metricas" id="metricas-episodio"></span>
+      </div>
+      <audio id="player" controls preload="metadata"></audio>
+      <div class="acoes">
+        <a id="link-baixar" download>Baixar áudio</a>
+        <a id="link-pasta" href="#" onclick="return false">…</a>
+      </div>
+      <div id="aviso-mp3" class="alerta aviso oculto"></div>
+      <div class="transcricao" id="transcricao"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const INTERVALO_POLLING = 2000;
+
+let jobAtual = null;      // id do job em andamento (evita dois em paralelo)
+let temporizador = null;  // handle do cronômetro
+
+// --------------------------------------------------------------------------
+// Diagnóstico do ambiente e catálogo de vozes (disparados em paralelo: o
+// checar_ambiente pode demorar até o timeout quando o Ollama está desligado,
+// e a lista de vozes não pode esperar por ele).
+// --------------------------------------------------------------------------
+async function carregarAmbiente() {
+  try {
+    const r = await fetch("/podcast/ambiente");
+    const d = await r.json();
+    const selo = $("selo-ollama");
+    selo.textContent = d.ollama_ok ? "Ollama no ar" : "Ollama offline";
+    selo.className = "selo " + (d.ollama_ok ? "ok" : "off");
+    selo.title = d.ollama_detalhe || "";
+    // Sem Ollama a IA não escreve roteiro — mas o resto do estúdio funciona.
+    $("btn-roteiro").disabled = !d.ollama_ok;
+
+    const ff = $("selo-ffmpeg");
+    ff.textContent = d.ffmpeg ? "FFmpeg (MP3)" : "sem FFmpeg (só WAV)";
+    ff.className = "selo " + (d.ffmpeg ? "ok" : "off");
+  } catch (e) {
+    $("selo-ollama").textContent = "API indisponível";
+  }
+}
+
+async function carregarVozes() {
+  const r = await fetch("/podcast/vozes");
+  const d = await r.json();
+  const seletores = [$("voz1"), $("voz2")];
+
+  seletores.forEach((sel, i) => {
+    sel.innerHTML = "";
+    d.vozes.forEach((v) => {
+      const op = document.createElement("option");
+      // Mostra o motivo de uma voz estar indisponível ou ser ruim, em vez de
+      // esconder: o usuário entende por que a lista é curta.
+      const notas = [];
+      if (!v.baixada) notas.push("não baixada");
+      if (v.aviso) notas.push(v.aviso);
+      op.value = v.id;
+      op.textContent = v.rotulo + (notas.length ? " — " + notas.join("; ") : "");
+      op.disabled = !v.baixada;
+      if (v.id === d.padrao[i]) op.selected = true;
+      sel.appendChild(op);
+    });
+  });
+}
+
+// --------------------------------------------------------------------------
+// Métricas do editor: contagem de falas e estimativa de duração, atualizadas
+// enquanto se digita. Repete a mesma regra do parse_roteiro do servidor de
+// forma simplificada — é só uma prévia, o servidor continua sendo a verdade.
+// --------------------------------------------------------------------------
+function atualizarMetricas() {
+  const linhas = $("roteiro").value.split("\n")
+    .filter((l) => /^\s*[^\s:]{1,32}\s*:\s*\S/.test(l));
+  const palavras = linhas.reduce(
+    (n, l) => n + l.split(":").slice(1).join(":").trim().split(/\s+/).filter(Boolean).length, 0);
+  const seg = Math.round((palavras / 150) * 60);
+  $("metricas").textContent = linhas.length
+    ? `${linhas.length} falas · ${palavras} palavras · ~${Math.floor(seg / 60)}:${String(seg % 60).padStart(2, "0")}`
+    : "nenhuma fala ainda";
+  $("btn-audio").disabled = linhas.length === 0 || jobAtual !== null;
+}
+
+// --------------------------------------------------------------------------
+// Estado visual
+// --------------------------------------------------------------------------
+const ROTULOS = {
+  na_fila: "Na fila…",
+  pesquisando: "Pesquisando e montando a pauta… (busca e lê as fontes)",
+  escrevendo_roteiro: "A equipe está escrevendo o roteiro… (leva alguns minutos)",
+  sintetizando: "Sintetizando as vozes e montando o programa…",
+};
+
+// O job informa em que etapa está ("bloco 3 de 5"). Mostrar isso é o que
+// diferencia "está trabalhando" de "travou" num processo de vários minutos.
+function rotuloDoJob(job) {
+  const base = ROTULOS[job.status] || "Trabalhando…";
+  return job.etapa ? `${base}  —  ${job.etapa}` : base;
+}
+
+function mostrarEstado(texto) {
+  $("estado").classList.add("visivel");
+  $("estado-texto").textContent = texto;
+  const inicio = Date.now();
+  clearInterval(temporizador);
+  temporizador = setInterval(() => {
+    const s = Math.floor((Date.now() - inicio) / 1000);
+    $("cronometro").textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }, 1000);
+}
+
+function esconderEstado() {
+  $("estado").classList.remove("visivel");
+  clearInterval(temporizador);
+}
+
+function mostrarErro(msg) {
+  const el = $("erro");
+  el.textContent = msg;
+  el.classList.remove("oculto");
+}
+
+function limparErro() { $("erro").classList.add("oculto"); }
+
+function travar(travado) {
+  jobAtual = travado ? jobAtual : null;
+  $("btn-roteiro").disabled = travado || $("selo-ollama").classList.contains("off");
+  $("btn-audio").disabled = travado;
+  if (!travado) atualizarMetricas();
+}
+
+// --------------------------------------------------------------------------
+// Ciclo de job: POST -> polling do /status -> conclusão
+// --------------------------------------------------------------------------
+async function postar(rota, corpo) {
+  const r = await fetch(rota, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(corpo),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail || `Falha HTTP ${r.status}`);
+  return d;
+}
+
+function acompanhar(jobId, aoConcluir) {
+  jobAtual = jobId;
+  const timer = setInterval(async () => {
+    let job;
+    try {
+      const r = await fetch(`/status/${jobId}`);
+      job = await r.json();
+    } catch (e) {
+      return; // falha de rede pontual: a próxima batida tenta de novo
+    }
+    if (job.status === "concluido" || job.status === "erro") {
+      clearInterval(timer);
+      esconderEstado();
+      travar(false);
+      if (job.status === "erro") mostrarErro(job.detalhe || "Falha desconhecida.");
+      else aoConcluir(job);
+      return;
+    }
+    $("estado-texto").textContent = rotuloDoJob(job);
+  }, INTERVALO_POLLING);
+}
+
+function corpoPedido() {
+  return {
+    tema: $("tema").value.trim(),
+    titulo: $("titulo").value.trim() || null,
+    minutos: parseInt($("minutos").value, 10),
+    modo: $("modo").value,
+    motor: $("motor").value,
+    vozes: [$("voz1").value, $("voz2").value],
+    contexto_extra: $("contexto").value.trim(),
+    trilha: $("trilha").value.trim() || null,
+  };
+}
+
+// --- Botão 1: a IA escreve o roteiro -------------------------------------
+$("btn-roteiro").addEventListener("click", async () => {
+  limparErro();
+  if (!$("tema").value.trim()) { mostrarErro("Descreva o tema do episódio."); return; }
+  travar(true);
+  mostrarEstado(ROTULOS.escrevendo_roteiro);
+  try {
+    const d = await postar("/podcast/roteiro", corpoPedido());
+    acompanhar(d.job_id, (job) => {
+      $("roteiro").value = job.roteiro || "";
+      atualizarMetricas();
+      $("roteiro").focus();
+    });
+  } catch (e) {
+    esconderEstado(); travar(false); mostrarErro(e.message);
+  }
+});
+
+// --- Botão 2: o roteiro (editado) vira áudio ------------------------------
+$("btn-audio").addEventListener("click", async () => {
+  limparErro();
+  const roteiro = $("roteiro").value.trim();
+  if (!roteiro) { mostrarErro("O roteiro está vazio."); return; }
+  travar(true);
+  $("cartao-episodio").classList.add("oculto");
+  mostrarEstado(ROTULOS.sintetizando);
+  try {
+    const d = await postar("/podcast", { ...corpoPedido(), roteiro });
+    acompanhar(d.job_id, mostrarEpisodio);
+  } catch (e) {
+    esconderEstado(); travar(false); mostrarErro(e.message);
+  }
+});
+
+$("btn-limpar").addEventListener("click", () => {
+  $("roteiro").value = "";
+  $("cartao-episodio").classList.add("oculto");
+  limparErro();
+  atualizarMetricas();
+});
+
+// --------------------------------------------------------------------------
+// Resultado
+// --------------------------------------------------------------------------
+function mostrarEpisodio(job) {
+  const cartao = $("cartao-episodio");
+  cartao.classList.remove("oculto");
+
+  // A URL leva o job_id, então cada episódio tem endereço próprio e o
+  // navegador não serve o áudio anterior do cache.
+  const url = job.audio_em || `/podcast/${job.job_id}/audio`;
+  $("player").src = url;
+  $("link-baixar").href = url;
+
+  const min = Math.floor(job.duracao / 60), seg = Math.round(job.duracao % 60);
+  $("metricas-episodio").textContent =
+    `${job.total_falas} falas · ${min}:${String(seg).padStart(2, "0")} · motor ${job.motor}`;
+
+  const caminho = job.arquivo_mp3 || job.arquivo_wav || "";
+  const link = $("link-pasta");
+  link.textContent = caminho ? caminho.split(/[\\/]/).pop() : "arquivo";
+  link.title = caminho;
+
+  const aviso = $("aviso-mp3");
+  aviso.classList.toggle("oculto", !job.aviso_mp3);
+  if (job.aviso_mp3) aviso.textContent = job.aviso_mp3;
+
+  const alvo = $("transcricao");
+  alvo.innerHTML = "";
+  const vozes = [...new Set((job.falas || []).map((f) => f.voz))];
+  (job.falas || []).forEach((f) => {
+    const div = document.createElement("div");
+    div.className = "fala" + (vozes.indexOf(f.voz) === 1 ? " v2" : "");
+    const b = document.createElement("b");
+    b.textContent = f.speaker;
+    const s = document.createElement("span");
+    s.textContent = f.text;   // textContent, nunca innerHTML: o texto vem do LLM
+    div.append(b, s);
+    alvo.appendChild(div);
+  });
+  cartao.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// --------------------------------------------------------------------------
+$("roteiro").addEventListener("input", atualizarMetricas);
+carregarAmbiente();
+carregarVozes().catch(() => mostrarErro("Não consegui carregar o catálogo de vozes."));
+atualizarMetricas();
+</script>
+</body>
+</html>

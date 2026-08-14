@@ -16,7 +16,11 @@ Uso:
 
 Endpoints:
   POST /agencia                 {"tema": "...", "webhook_url": "http://... (opcional)"}
-  GET  /status/{job_id}         situação e resultado do job
+  GET  /status/{job_id}         situação e resultado do job (agência OU podcast)
+  POST /podcast                 {"tema": ...} ou {"roteiro": ...} -> episódio
+  GET  /podcast/vozes           catálogo pt-BR e quais vozes já estão em disco
+  GET  /podcast/{job_id}/audio  o episódio pronto (MP3, ou WAV se faltar FFmpeg)
+  GET  /estudio                 o painel HTML do Estúdio de Podcast
   POST /v1/chat/completions     fachada OpenAI (streaming SSE) — para editores
   GET  /v1/models               lista o modelo "cortexus-crew"
 """
@@ -24,6 +28,7 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 import urllib.error
@@ -32,10 +37,13 @@ import uuid
 from collections.abc import Iterator
 from datetime import datetime
 
+from pathlib import Path
+
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+import podcast as estudio
 from main import (
     OUTPUT_DIR,
     TEMA_PADRAO,
@@ -65,6 +73,34 @@ class PedidoAgencia(BaseModel):
     usar_memoria: bool = False  # memória de longo prazo (default off; ver montar_equipe)
     contexto_extra: str = ""     # texto de arquivo(s) anexado(s) no painel (upload)
     usar_gerente: bool = False   # processo hierárquico com Gerente (default off)
+
+
+class PedidoPodcast(BaseModel):
+    """Pedido do Estúdio de Podcast.
+
+    Dois caminhos de entrada, e é o que torna o estúdio utilizável HOJE:
+      - `roteiro` preenchido: pula a crew e vai direto para as vozes. Não
+        exige Ollama nem modelo baixado.
+      - `tema` preenchido: a crew do main.py escreve o roteiro antes (aí sim
+        exige Ollama no ar).
+    Se os dois vierem, `roteiro` vence — o texto que o usuário escreveu à mão
+    nunca deve ser descartado em favor de uma geração.
+    """
+
+    tema: str = ""
+    roteiro: str = ""
+    titulo: str | None = None
+    minutos: int = 5
+    # "blocos" (padrão): a crew pesquisa e devolve uma pauta, depois um passe
+    # curto por bloco. "unico": um só pedido para a crew — mais rápido, mas
+    # entrega bem menos falas do que o alvo (medido: 11 de ~40).
+    modo: str = "blocos"
+    motor: str = "piper"            # "piper" (voz) | "tom" (demonstração)
+    vozes: list[str] | None = None  # nomes do catálogo VOZES_PT_BR
+    trilha: str | None = None       # WAV de fundo, caminho DENTRO do projeto
+    contexto_extra: str = ""
+    usar_memoria: bool = False
+    webhook_url: str | None = None
 
 
 class NexusAssist(BaseModel):
@@ -190,21 +226,14 @@ def _rodar_agencia(
         )
 
 
-@app.post("/agencia")
-def executar_agencia(pedido: PedidoAgencia, tarefas: BackgroundTasks):
-    """Aceita o pedido, valida o ambiente e agenda a equipe em background.
-    Responde imediatamente — o n8n nunca mais vê timeout."""
-    problema = diagnostico_ollama()
-    if problema:
-        raise HTTPException(status_code=503, detail=problema)
+def _registrar_job(tema: str, **extras) -> str:
+    """Cria a entrada do job no registro em memória e devolve o job_id.
 
-    if pedido.webhook_url and not pedido.webhook_url.lower().startswith(
-        ("http://", "https://")
-    ):
-        raise HTTPException(
-            status_code=400, detail="webhook_url deve começar com http:// ou https://"
-        )
-
+    Extraído para ser compartilhado por /agencia e /podcast: são dois tipos de
+    trabalho, mas a poda do registro e o teto de jobs precisam valer para os
+    dois — se cada endpoint tivesse a sua cópia, o teto deixaria de ser uma
+    garantia real no momento em que um deles esquecesse de podar.
+    """
     job_id = uuid.uuid4().hex
     with _jobs_lock:
         # Poda os jobs finalizados mais antigos para a memória não crescer sem fim
@@ -225,9 +254,30 @@ def executar_agencia(pedido: PedidoAgencia, tarefas: BackgroundTasks):
         _jobs[job_id] = {
             "job_id": job_id,
             "status": "na_fila",
-            "tema": tema_curto(pedido.tema),
+            "tema": tema_curto(tema),
             "criado_em": datetime.now().isoformat(timespec="seconds"),
+            **extras,
         }
+    return job_id
+
+
+def _validar_webhook(url: str | None) -> None:
+    if url and not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400, detail="webhook_url deve começar com http:// ou https://"
+        )
+
+
+@app.post("/agencia")
+def executar_agencia(pedido: PedidoAgencia, tarefas: BackgroundTasks):
+    """Aceita o pedido, valida o ambiente e agenda a equipe em background.
+    Responde imediatamente — o n8n nunca mais vê timeout."""
+    problema = diagnostico_ollama()
+    if problema:
+        raise HTTPException(status_code=503, detail=problema)
+
+    _validar_webhook(pedido.webhook_url)
+    job_id = _registrar_job(pedido.tema)
 
     tarefas.add_task(
         _rodar_agencia,
@@ -259,6 +309,414 @@ def status_job(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="job_id desconhecido")
     return job
+
+
+# ---------------------------------------------------------------------------
+# ESTÚDIO DE PODCAST — roteiro (crew ou colado) -> vozes -> episódio
+# ---------------------------------------------------------------------------
+# Por que um endpoint próprio em vez de reaproveitar /agencia: o resultado
+# aqui é BINÁRIO. O registro de jobs guarda `conteudo` como string e o
+# /status devolve JSON — áudio não cabe nesse contrato. Então o job guarda os
+# CAMINHOS dos arquivos e o áudio sai por uma rota dedicada, que faz stream do
+# arquivo. O resto da infraestrutura (registro, poda, polling, webhook) é
+# reaproveitado como está.
+WEB_DIR = estudio.BASE_DIR / "web"
+
+
+def _caminho_de_projeto(bruto: str, sufixos: tuple[str, ...]) -> Path:
+    """Resolve um caminho vindo do cliente e recusa qualquer um fora do projeto.
+
+    Mesmo princípio do sandbox de terminal do main.py: a API escuta em
+    0.0.0.0 sem autenticação, então um caminho arbitrário no corpo do POST
+    não pode virar leitura de qualquer arquivo do disco. `resolve()` fecha o
+    buraco de "..\\" e de symlink.
+    """
+    alvo = Path(bruto)
+    alvo = (estudio.BASE_DIR / alvo).resolve() if not alvo.is_absolute() else alvo.resolve()
+    if estudio.BASE_DIR not in alvo.parents:
+        raise HTTPException(
+            status_code=400, detail="Caminho fora da pasta do projeto — bloqueado."
+        )
+    if alvo.suffix.lower() not in sufixos:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Extensão não aceita ({alvo.suffix or 'sem extensão'}). "
+            f"Use: {', '.join(sufixos)}",
+        )
+    if not alvo.is_file():
+        raise HTTPException(status_code=404, detail=f"Arquivo não encontrado: {bruto}")
+    return alvo
+
+
+def _rodar_podcast(job_id: str, pedido: PedidoPodcast, trilha: Path | None) -> None:
+    """Roda em background: (1) roteiro, (2) vozes, (3) montagem.
+
+    O `status` avança em etapas nomeadas porque o estúdio HTML mostra em qual
+    delas o job está — num episódio de 5 minutos a escrita pode levar minutos
+    e a síntese mais um tanto, e uma barra parada sem rótulo parece travamento.
+    """
+    try:
+        apresentadores = estudio.montar_apresentadores(pedido.vozes)
+
+        roteiro = pedido.roteiro.strip()
+        if roteiro:
+            _atualizar_job(job_id, status="sintetizando", origem_roteiro="colado")
+        else:
+            _atualizar_job(job_id, origem_roteiro="crew")
+            escrever = (
+                _escrever_em_passe_unico
+                if pedido.modo.strip().lower() == "unico"
+                else _escrever_em_blocos
+            )
+            saida = escrever(job_id, pedido, apresentadores)
+            roteiro = saida["bruto"]
+            _atualizar_job(
+                job_id,
+                status="sintetizando",
+                etapa="",
+                blocos=saida["blocos"],
+                arquivo_roteiro_bruto=saida["arquivo_roteiro"],
+            )
+
+        resultado = estudio.gerar_podcast(
+            roteiro,
+            titulo=pedido.titulo or tema_curto(pedido.tema or "Episódio", 60),
+            motor=pedido.motor,
+            apresentadores=apresentadores,
+            trilha=trilha,
+        )
+        campos = {
+            "arquivo_wav": resultado["arquivo_wav"],
+            "arquivo_mp3": resultado["arquivo_mp3"],
+            "arquivo_roteiro": resultado["arquivo_roteiro"],
+            "duracao": resultado["duracao"],
+            "total_falas": resultado["total_falas"],
+            "falas": resultado["falas"],
+            "motor": resultado["motor"],
+            "aviso_mp3": resultado["aviso_mp3"],
+            "audio_em": f"/podcast/{job_id}/audio",
+        }
+        _atualizar_job(
+            job_id,
+            status="concluido",
+            terminado_em=datetime.now().isoformat(timespec="seconds"),
+            **campos,
+        )
+        payload = {"job_id": job_id, "status": "concluido", **campos}
+    except Exception as erro:
+        _atualizar_job(
+            job_id,
+            status="erro",
+            detalhe=str(erro),
+            terminado_em=datetime.now().isoformat(timespec="seconds"),
+        )
+        payload = {"job_id": job_id, "status": "erro", "detalhe": str(erro)}
+
+    if pedido.webhook_url:
+        erro_webhook = _disparar_webhook(pedido.webhook_url, payload)
+        _atualizar_job(
+            job_id,
+            webhook_entregue=(erro_webhook is None),
+            webhook_detalhe=erro_webhook,
+        )
+
+
+@app.post("/podcast")
+def criar_podcast(pedido: PedidoPodcast, tarefas: BackgroundTasks):
+    """Agenda a produção de um episódio e responde na hora com o job_id.
+
+    Toda validação cara acontece AQUI, no caminho síncrono: motor conhecido,
+    vozes existentes, modelo baixado, trilha dentro do projeto. Descobrir
+    qualquer uma dessas coisas lá no background significaria o usuário
+    esperar minutos para receber um erro que era visível no primeiro segundo.
+    """
+    _validar_webhook(pedido.webhook_url)
+
+    if not pedido.roteiro.strip() and not pedido.tema.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Informe 'roteiro' (texto pronto) ou 'tema' (a crew escreve).",
+        )
+
+    # Só o caminho que passa pela crew depende do Ollama; um roteiro colado
+    # gera áudio com o Ollama desligado, e é isso que faz o estúdio ser útil
+    # antes de os modelos estarem instalados.
+    if not pedido.roteiro.strip():
+        problema = diagnostico_ollama()
+        if problema:
+            raise HTTPException(status_code=503, detail=problema)
+
+    if not 1 <= pedido.minutos <= 60:
+        raise HTTPException(status_code=400, detail="minutos deve ficar entre 1 e 60.")
+
+    try:
+        apresentadores = estudio.montar_apresentadores(pedido.vozes)
+        motor = estudio.criar_motor(pedido.motor)
+        motor.verificar(apresentadores)
+    except estudio.ErroPodcast as erro:
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+
+    trilha = (
+        _caminho_de_projeto(pedido.trilha, (".wav",)) if pedido.trilha else None
+    )
+
+    job_id = _registrar_job(
+        pedido.tema or (pedido.titulo or "roteiro colado"), tipo="podcast"
+    )
+    tarefas.add_task(_rodar_podcast, job_id, pedido, trilha)
+    return {
+        "status": "Recebido! Produzindo o episódio...",
+        "job_id": job_id,
+        "acompanhe_em": f"/status/{job_id}",
+        "audio_em": f"/podcast/{job_id}/audio",
+    }
+
+
+def _escrever_em_blocos(job_id: str, pedido: PedidoPodcast, apresentadores) -> dict:
+    """Pauta pesquisada pela crew + um passe curto por bloco.
+
+    A pesquisa (com busca e leitura de página) roda UMA vez, na pauta. Os
+    blocos são chamadas DIRETAS ao LLM (`llm.call`), sem crew: eles não
+    precisam de ferramenta nenhuma, só dos fatos que a pauta já trouxe, e
+    rodar quatro agentes por bloco multiplicaria o tempo sem ganho.
+    """
+    total = estudio.blocos_para(pedido.minutos)
+    _atualizar_job(job_id, status="pesquisando", etapa="pauta")
+
+    res = _gerar_resultado(
+        estudio.prompt_pauta(
+            pedido.tema,
+            minutos=pedido.minutos,
+            blocos=total,
+            tem_contexto=bool(pedido.contexto_extra.strip()),
+        ),
+        usar_memoria=pedido.usar_memoria,
+        contexto_extra=pedido.contexto_extra,
+    )
+    pauta_bruta = res["conteudo_limpo"]
+    blocos = estudio.dividir_pauta(pauta_bruta, total)
+
+    llm = criar_llm()
+    alvo_falas = estudio.falas_por_bloco(pedido.minutos, len(blocos))
+    falas: list[estudio.Fala] = []
+    partes: list[str] = []
+
+    for indice, bloco in enumerate(blocos, start=1):
+        _atualizar_job(
+            job_id,
+            status="escrevendo_roteiro",
+            etapa=f"bloco {indice} de {len(blocos)}",
+        )
+        try:
+            texto = llm.call(
+                estudio.prompt_bloco(
+                    pedido.tema,
+                    bloco,
+                    indice=indice,
+                    total=len(blocos),
+                    apresentadores=apresentadores,
+                    falas=alvo_falas,
+                    ultimas_falas=estudio.ultimas_falas_como_texto(falas),
+                )
+            )
+        except Exception as erro:
+            # Um bloco que falha não derruba o episódio: os outros já escritos
+            # continuam valendo, e o usuário completa o buraco na mão no editor.
+            partes.append(f"[bloco {indice} falhou: {erro}]")
+            continue
+        partes.append(texto or "")
+        # Reparseia o acumulado a cada bloco para (a) alimentar a continuidade
+        # do próximo com falas JÁ limpas e (b) deduplicar nas emendas.
+        falas = estudio.parse_roteiro("\n".join(partes))
+
+    return {
+        "falas": falas,
+        "bruto": "\n\n".join(partes),
+        "pauta": pauta_bruta,
+        "blocos": len(blocos),
+        "arquivo_roteiro": res["arquivo"],
+    }
+
+
+def _escrever_em_passe_unico(job_id: str, pedido: PedidoPodcast, apresentadores) -> dict:
+    """Modo antigo: um único pedido para a crew. Mais rápido, entrega menos."""
+    _atualizar_job(job_id, status="escrevendo_roteiro", etapa="passe único")
+    res = _gerar_resultado(
+        estudio.prompt_roteiro(
+            pedido.tema,
+            minutos=pedido.minutos,
+            apresentadores=apresentadores,
+            tem_contexto=bool(pedido.contexto_extra.strip()),
+        ),
+        usar_memoria=pedido.usar_memoria,
+        contexto_extra=pedido.contexto_extra,
+    )
+    bruto = res["conteudo_limpo"]
+    return {
+        "falas": estudio.parse_roteiro(bruto),
+        "bruto": bruto,
+        "pauta": None,
+        "blocos": 1,
+        "arquivo_roteiro": res["arquivo"],
+    }
+
+
+def _rodar_roteiro(job_id: str, pedido: PedidoPodcast) -> None:
+    """Só a etapa 1: a equipe escreve o roteiro e para por aí."""
+    _atualizar_job(job_id, status="escrevendo_roteiro")
+    try:
+        apresentadores = estudio.montar_apresentadores(pedido.vozes)
+        escrever = (
+            _escrever_em_passe_unico
+            if pedido.modo.strip().lower() == "unico"
+            else _escrever_em_blocos
+        )
+        saida = escrever(job_id, pedido, apresentadores)
+
+        falas = saida["falas"]
+        # Devolve o roteiro JÁ NORMALIZADO pelo parser (sem markdown, sem
+        # rubricas, sem preâmbulo). Assim o que o usuário edita na tela é
+        # exatamente o que vai virar áudio — sem surpresa entre o que ele leu
+        # e o que o sintetizador recebeu.
+        campos = {
+            "roteiro": "\n".join(f"{f.locutor}: {f.texto}" for f in falas),
+            "roteiro_bruto": saida["bruto"],
+            "pauta": saida["pauta"],
+            "blocos": saida["blocos"],
+            "total_falas": len(falas),
+            "arquivo_roteiro": saida["arquivo_roteiro"],
+        }
+        _atualizar_job(
+            job_id,
+            status="concluido",
+            terminado_em=datetime.now().isoformat(timespec="seconds"),
+            **campos,
+        )
+        payload = {"job_id": job_id, "status": "concluido", **campos}
+    except Exception as erro:
+        _atualizar_job(
+            job_id,
+            status="erro",
+            detalhe=str(erro),
+            terminado_em=datetime.now().isoformat(timespec="seconds"),
+        )
+        payload = {"job_id": job_id, "status": "erro", "detalhe": str(erro)}
+
+    if pedido.webhook_url:
+        _disparar_webhook(pedido.webhook_url, payload)
+
+
+@app.post("/podcast/roteiro")
+def escrever_roteiro(pedido: PedidoPodcast, tarefas: BackgroundTasks):
+    """Escreve o roteiro SEM sintetizar — o passo que faz o estúdio ser usável.
+
+    A crew leva minutos e o 7B erra o tom de vez em quando; a síntese leva
+    mais minutos. Sintetizar direto significaria jogar fora as duas etapas
+    por causa de um roteiro ruim. Separando, o usuário lê, corrige à mão e só
+    então paga o custo do áudio — e corrigir texto é grátis.
+    """
+    _validar_webhook(pedido.webhook_url)
+    if not pedido.tema.strip():
+        raise HTTPException(status_code=400, detail="Informe o 'tema' do episódio.")
+    if not 1 <= pedido.minutos <= 60:
+        raise HTTPException(status_code=400, detail="minutos deve ficar entre 1 e 60.")
+
+    problema = diagnostico_ollama()
+    if problema:
+        raise HTTPException(status_code=503, detail=problema)
+
+    job_id = _registrar_job(pedido.tema, tipo="roteiro")
+    tarefas.add_task(_rodar_roteiro, job_id, pedido)
+    return {
+        "status": "Recebido! Escrevendo o roteiro...",
+        "job_id": job_id,
+        "acompanhe_em": f"/status/{job_id}",
+    }
+
+
+@app.get("/podcast/vozes")
+def listar_vozes():
+    """Catálogo pt-BR + quais já estão baixadas — popula o seletor do estúdio.
+
+    `baixada` importa: sem ela o usuário escolheria uma voz que não existe em
+    disco e só descobriria no POST. Com ela, o estúdio já mostra desabilitada.
+    """
+    motor = estudio.MotorPiper()
+    return {
+        "pasta": str(motor.dir_vozes),
+        "vozes": [
+            {
+                "id": nome,
+                "baixada": motor.caminho_voz(nome).exists(),
+                **ficha,
+            }
+            for nome, ficha in estudio.VOZES_PT_BR.items()
+        ],
+        "motores": sorted(estudio.MOTORES),
+        "padrao": [a.voz for a in estudio.APRESENTADORES_PADRAO],
+    }
+
+
+@app.get("/podcast/ambiente")
+def checar_ambiente():
+    """Diagnóstico que o estúdio consulta ao abrir.
+
+    Fica separado de /podcast/vozes de propósito: `diagnostico_ollama` faz uma
+    chamada de rede que só retorna no timeout quando o Ollama está desligado,
+    e a lista de vozes (leitura de disco, instantânea) não pode ficar refém
+    dela. Assim o navegador dispara as duas em paralelo e a tela monta na hora.
+    """
+    problema = diagnostico_ollama()
+    return {
+        "ollama_ok": problema is None,
+        "ollama_detalhe": problema,
+        "ffmpeg": shutil.which("ffmpeg") is not None,
+    }
+
+
+@app.get("/podcast/{job_id}/audio")
+def baixar_audio(job_id: str):
+    """Entrega o episódio: MP3 quando houver, WAV como alternativa.
+
+    É a rota que a tag <audio> do estúdio consome. O FileResponse faz stream
+    do arquivo do disco, então um episódio de uma hora não é carregado na
+    memória do servidor para ser servido.
+    """
+    with _jobs_lock:
+        job = dict(_jobs.get(job_id) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="job_id desconhecido")
+    if job.get("status") != "concluido":
+        raise HTTPException(
+            status_code=409,
+            detail=f"O episódio ainda não está pronto (status: {job.get('status')}).",
+        )
+
+    caminho = job.get("arquivo_mp3") or job.get("arquivo_wav")
+    if not caminho or not Path(caminho).is_file():
+        raise HTTPException(status_code=404, detail="Arquivo de áudio não encontrado.")
+
+    arquivo = Path(caminho)
+    return FileResponse(
+        arquivo,
+        media_type="audio/mpeg" if arquivo.suffix == ".mp3" else "audio/wav",
+        filename=arquivo.name,
+    )
+
+
+@app.get("/estudio")
+def abrir_estudio():
+    """Serve o estúdio HTML pela PRÓPRIA API, e não como arquivo solto.
+
+    Motivo técnico, não estético: aberto via file://, o navegador trataria a
+    página e a API como origens diferentes e o fetch morreria no CORS. Servido
+    daqui, tudo é a mesma origem (localhost:8000) e não existe configuração de
+    CORS para acertar.
+    """
+    pagina = WEB_DIR / "estudio.html"
+    if not pagina.is_file():
+        raise HTTPException(status_code=404, detail=f"Página não encontrada: {pagina}")
+    return FileResponse(pagina, media_type="text/html; charset=utf-8")
 
 
 # ---------------------------------------------------------------------------

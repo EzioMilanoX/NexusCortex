@@ -28,5 +28,7 @@ until curl -s -o /dev/null http://127.0.0.1:8501/_stcore/health; do sleep 1; don
 echo "[Cortexus] Tudo no ar! Abrindo o navegador..."
 xdg-open http://localhost:8501 >/dev/null 2>&1 || true
 
+echo "[Cortexus] Estudio de Podcast: http://localhost:8000/estudio"
+echo "           (ja esta no ar - a API acima o serve; ou use ./estudio.sh)"
 echo "[Cortexus] Rodando. Pressione Ctrl+C para desligar tudo."
 wait

@@ -164,6 +164,18 @@ def render_resposta(idx: int, entry: dict) -> None:
 with st.sidebar:
     st.header("⚙️ Controles")
 
+    # O Estúdio de Podcast é servido pela MESMA API que este painel consome,
+    # então quando o painel está no ar o estúdio também está — basta o link.
+    st.link_button(
+        "🎙️ Abrir o Estúdio de Podcast",
+        f"{API_BASE.replace('127.0.0.1', 'localhost')}/estudio",
+        use_container_width=True,
+        help=(
+            "Roteiro escrito pela equipe (ou colado por você) virando um "
+            "episódio narrado por duas vozes pt-BR. Abre em outra aba."
+        ),
+    )
+
     modo = st.radio(
         "Modo de execução",
         ["Sequencial (rápido, confiável)", "Gerente (hierárquico, flexível)"],

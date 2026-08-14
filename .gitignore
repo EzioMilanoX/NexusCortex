@@ -14,6 +14,14 @@ __pycache__/
 # Saídas geradas pelos agentes
 output/*.txt
 
+# Episódios do Estúdio de Podcast — um programa de 15 min passa de 40 MB em
+# WAV; nada disso pode entrar no histórico do git.
+output/podcast/
+
+# Vozes do Piper (~63 MB cada .onnx). São baixadas sob demanda com
+# 'python -m piper.download_voices' — ver README.
+vozes/
+
 # Segredos / configuração local
 .env
 

@@ -26,18 +26,26 @@ Uso (Terminal do Linux Mint ou PowerShell do Windows):
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import re
 import shlex
+import socket
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 from crewai import Agent, Crew, LLM, Process, Task
 from crewai.tools import tool
-from crewai_tools import DirectoryReadTool, DirectorySearchTool, FileReadTool
+from crewai_tools import (
+    DirectoryReadTool,
+    DirectorySearchTool,
+    FileReadTool,
+    ScrapeWebsiteTool,
+)
 from crewai_tools.security.safe_path import (
     format_error_for_display,
     format_path_for_display,
@@ -153,22 +161,302 @@ def criar_llm() -> LLM:
 # ---------------------------------------------------------------------------
 # FERRAMENTAS (TOOLS)
 # ---------------------------------------------------------------------------
+# Domínios que nunca têm prosa para ler (vídeo, rede social, áudio).
+_DOMINIOS_SEM_TEXTO = (
+    "youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "twitch.tv",
+    "instagram.com", "tiktok.com", "facebook.com", "twitter.com", "x.com",
+    "spotify.com", "soundcloud.com", "pinterest.com",
+)
+# Agregadores de slides/respostas: têm prosa, mas prosa de qualidade
+# imprevisível e sem revisão. Nunca são lidos — só poluiriam o contexto.
+_DOMINIOS_DESCARTADOS = (
+    "prezi.com", "slideshare.net", "scribd.com", "coursehero.com",
+    "passeidireto.com", "brainly.com", "quora.com", "answers.com",
+    "pinterest.com", "medium.com/@",
+)
+# FONTE DE REFERÊNCIA: enciclopédia, domínio institucional, documentação
+# oficial. É de onde devem sair datas, nomes próprios e definições.
+_DOMINIOS_REFERENCIA = (
+    "wikipedia.org", "britannica.com", "plato.stanford.edu", "arxiv.org",
+    ".gov", ".gov.br", ".edu", ".edu.br", ".ac.uk", "docs.python.org", "docs.",
+    "developer.mozilla.org", "scielo.",
+)
+# Ordem de preferência para escolher quem ler primeiro.
+_DOMINIOS_PREFERIDOS = _DOMINIOS_REFERENCIA + (".org",)
+
+# Quantas páginas a busca lê sozinha, e o teto de texto que elas somam. Dois
+# mil e quinhentos caracteres são ~600 tokens: cabem no num_ctx 8192 junto do
+# backstory e dos esquemas das cinco ferramentas.
+MAX_FONTES_LIDAS = 2
+ORCAMENTO_FONTES = 2500
+
+
+def _vale_ler(url: str) -> bool:
+    baixo = (url or "").lower()
+    if not baixo.startswith(("http://", "https://")):
+        return False
+    if baixo.endswith((".pdf", ".zip", ".mp4", ".mp3", ".jpg", ".png")):
+        return False
+    if any(d in baixo for d in _DOMINIOS_DESCARTADOS):
+        return False
+    return not any(d in baixo for d in _DOMINIOS_SEM_TEXTO)
+
+
+def _eh_referencia(url: str) -> bool:
+    """True para enciclopédia/instituição/documentação — a fonte que pode ser
+    citada para uma DATA ou uma DEFINIÇÃO."""
+    return any(d in (url or "").lower() for d in _DOMINIOS_REFERENCIA)
+
+
+def _nota_de_credibilidade(url: str) -> int:
+    """Menor é melhor — usado só para ordenar quem será lido primeiro."""
+    baixo = (url or "").lower()
+    for posicao, marca in enumerate(_DOMINIOS_PREFERIDOS):
+        if marca in baixo:
+            return posicao
+    return len(_DOMINIOS_PREFERIDOS)
+
+
+def _ler_fontes(resultados: list[dict]) -> str:
+    """Abre sozinha as fontes mais credíveis da busca e devolve o texto delas.
+
+    POR QUE A BUSCA LÊ SOZINHA, em vez de esperar o agente pedir. A ferramenta
+    'Ler Página Web' existe e funciona, mas foi MEDIDO que o qwen 7B não a
+    chama: num teste completo o log registrou uma única execução de ferramenta
+    ('busca_na_web') e nenhuma leitura, mesmo com a instrução "OBRIGATÓRIO" no
+    prompt do agente E na tarefa. É a mesma limitação já documentada do
+    terminal, que o Escritor também ignora.
+    Enquanto a leitura era uma DECISÃO do modelo, ela simplesmente não
+    acontecia. Fundindo busca e leitura numa ferramenta só, a decisão deixa de
+    existir: o agente pede uma busca e recebe prosa junto, queira ou não. É a
+    mesma escolha de projeto do `escolher_saida` e do `parse_roteiro` — quando
+    o passo é essencial, ele mora no código, não na obediência do modelo.
+    """
+    candidatos = sorted(
+        (r for r in resultados if _vale_ler(r.get("href", ""))),
+        key=lambda r: _nota_de_credibilidade(r.get("href", "")),
+    )
+
+    trechos: list[str] = []
+    gasto = 0
+    for r in candidatos:
+        if len(trechos) >= MAX_FONTES_LIDAS or gasto >= ORCAMENTO_FONTES:
+            break
+        url = r.get("href", "")
+        # Chama a função interna, não a @tool: `ler_pagina_web` já é um objeto
+        # de ferramenta do CrewAI aqui, e invocá-lo por dentro custaria o
+        # empacotamento de argumentos sem ganho nenhum.
+        problema = _url_segura(url)
+        if problema:
+            continue
+        try:
+            texto = _enxugar_pagina(
+                _raspador.run(website_url=url),
+                limite=min(ORCAMENTO_FONTES - gasto, ORCAMENTO_FONTES),
+            )
+        except Exception:
+            continue  # fonte ruim não derruba a busca; tenta a próxima
+        if not texto:
+            continue  # página sem prosa (vídeo, JS) — não conta no orçamento
+        # O rótulo do nível importa: num teste real o único erro factual que
+        # sobreviveu ("equilíbrio de Nash formulado no início do século XX";
+        # foi 1950-51) veio de um blog de consultoria lido junto da Wikipédia.
+        # O modelo não tinha como saber qual das duas fontes pesava mais.
+        nivel = "FONTE DE REFERÊNCIA" if _eh_referencia(url) else "FONTE SECUNDÁRIA"
+        trechos.append(f"[{nivel}] TEXTO DE {url}:\n{texto}")
+        gasto += len(texto)
+
+    if not trechos:
+        return (
+            "\n\nNENHUMA das páginas devolveu texto legível. NÃO invente o "
+            "conteúdo: refaça a busca com outras palavras-chave, ou diga "
+            "explicitamente que não encontrou fonte."
+        )
+
+    regra = (
+        "DATAS, NOMES PRÓPRIOS e DEFINIÇÕES devem sair da FONTE DE REFERÊNCIA. "
+        "A FONTE SECUNDÁRIA serve para exemplos e aplicações, e não para "
+        "corrigir ou contradizer a de referência."
+        if any(t.startswith("[FONTE DE REFERÊNCIA]") for t in trechos)
+        else "Nenhuma fonte de referência foi encontrada: trate as datas e os "
+        "números abaixo como incertos e diga isso no dossiê."
+    )
+    return (
+        "\n\n=== TEXTO DAS FONTES (leia e cite daqui) ===\n"
+        f"{regra}\n\n" + "\n\n".join(trechos)
+    )
+
+
 @tool("Busca na Web")
 def busca_web(query: str) -> str:
-    """Busca na web e retorna os 5 melhores resultados. Usado pelo Pesquisador."""
+    """Busca na web e retorna os 5 melhores resultados E o TEXTO das páginas
+    mais confiáveis entre eles, já aberto para você. Use as definições, nomes e
+    números que aparecem nesse texto — é a sua fonte. Usado pelo Pesquisador."""
     try:
         resultados = DDGS().text(query, max_results=5)
     except Exception as erro:
         # Tratamento de erro vital para modelos locais de 8B não entrarem em colapso
         return f"A busca falhou ({erro}). Tente de novo com palavras-chave diferentes."
-    
+
     if not resultados:
         return f"Nenhum resultado para '{query}'. Tente outras palavras-chave."
-    
-    return "\n\n".join(
+
+    lista = "\n\n".join(
         f"{i}. {r.get('title', '(sem título)')}\n{r.get('href', '')}\n{r.get('body', '')}"
         for i, r in enumerate(resultados, 1)
     )
+    return lista + _ler_fontes(resultados)
+
+# ---------------------------------------------------------------------------
+# LEITURA DE PÁGINA WEB
+# ---------------------------------------------------------------------------
+# POR QUE ESTA FERRAMENTA EXISTE. A `busca_web` devolve apenas título + link +
+# snippet do DDGS — o agente nunca via o TEXTO de nada. Diagnosticado num teste
+# real: pedimos um podcast sobre "teoria dos jogos", a busca retornou três
+# vídeos do YouTube e uma página de curso, e o modelo, sem nada em que se
+# apoiar, escreveu de memória — definiu equilíbrio de Nash errado e inventou
+# exemplos ("jogo do lembretista"). Não era limite do 7B: era falta de acesso
+# ao conteúdo. Com esta ferramenta o fluxo fecha: buscar -> escolher a fonte
+# credível -> LER -> escrever a partir do texto.
+#
+# A ScrapeWebsiteTool do crewai-tools é gratuita e sem chave de API (é
+# scraper, não busca — a observação do README sobre "todas exigem chave" vale
+# para as ferramentas de BUSCA). Mas ela é crua: devolve o menu de navegação
+# junto e não tem teto de tamanho. Daí o invólucro abaixo, na mesma linha do
+# FileReadToolUTF8: usa o motor de terceiro, corrige o comportamento.
+LIMITE_PAGINA_WEB = 4000  # ~1000 tokens: caber no num_ctx 8192 com folga
+
+# Prefixo que a ScrapeWebsiteTool cola no começo do retorno.
+_PREFIXO_SCRAPE = "The following text is scraped website content:"
+
+
+def _url_segura(url: str) -> str | None:
+    """Valida a URL antes de buscá-la. Devolve o erro, ou None se estiver ok.
+
+    Isto é sandbox, não paranoia decorativa. O Pesquisador processa texto NÃO
+    CONFIÁVEL da web aberta, então uma injeção de prompt pode fazê-lo pedir
+    qualquer URL. Duas portas ficam fechadas:
+
+    1. ESQUEMA: só http/https. Sem isto, um `file:///C:/Users/...` usaria esta
+       ferramenta para contornar o confinamento a BASE_DIR que o crewai-tools
+       impõe às ferramentas de disco.
+    2. DESTINO INTERNO (SSRF): resolve o host e recusa loopback, rede privada
+       e link-local. Senão `http://localhost:11434` ou um IP 192.168.x.x da
+       rede doméstica seriam alcançáveis pelo agente — inclusive a própria
+       API do Cortexus, que roda sem autenticação.
+    """
+    try:
+        partes = urllib.parse.urlparse(url.strip())
+    except ValueError:
+        return "URL malformada."
+
+    if partes.scheme not in ("http", "https"):
+        return (
+            f"Esquema '{partes.scheme or 'ausente'}' bloqueado. Só http:// e "
+            "https:// são permitidos (para ler arquivos locais use as "
+            "ferramentas de disco)."
+        )
+    if not partes.hostname:
+        return "URL sem domínio."
+
+    try:
+        enderecos = socket.getaddrinfo(partes.hostname, None)
+    except (OSError, UnicodeError):
+        return f"Não consegui resolver o domínio '{partes.hostname}'."
+
+    for info in enderecos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+        ):
+            return (
+                f"Endereço interno bloqueado ({ip}). Esta ferramenta só "
+                "alcança a internet pública."
+            )
+    return None
+
+
+# Fim de frase, tolerando o fechamento de citação/parêntese depois do ponto.
+_RE_FIM_DE_FRASE = re.compile(r"[.!?][\"'”’)\]]?$")
+# Marcador de referência da Wikipédia ("[1]", "[nota 2]") — não se pronuncia.
+_RE_REFERENCIA = re.compile(r"\[\s*(?:\d+|nota\s*\d+|editar[^\]]*)\s*\]", re.IGNORECASE)
+
+
+def _enxugar_pagina(bruto: str, limite: int = LIMITE_PAGINA_WEB) -> str:
+    """Tira a navegação e trunca — o que sobra é texto de leitura.
+
+    O CRITÉRIO é "a linha termina em pontuação de frase?", e não o tamanho
+    dela. Foi a segunda tentativa: filtrar por linhas curtas deixava passar
+    justamente o pior lixo, porque o scraper junta o menu inteiro numa linha
+    longuíssima ("Página principal Conteúdo destacado Eventos atuais...") e a
+    lista de idiomas da Wikipédia noutra. Nenhuma das duas termina em ponto;
+    todo parágrafo de prosa termina.
+
+    Efeito colateral desejado: uma página de vídeo do YouTube não tem prosa
+    nenhuma, então sobra vazio e a ferramenta avisa que não há o que ler — em
+    vez de entregar "About Press Copyright Contact us" como se fosse fonte.
+    Era exatamente o caso que produziu o roteiro alucinado.
+    """
+    texto = bruto.replace(_PREFIXO_SCRAPE, "", 1)
+
+    uteis: list[str] = []
+    for linha in texto.splitlines():
+        linha = " ".join(linha.split())  # colapsa espaços e tabs
+        if not linha:
+            continue
+        linha = _RE_REFERENCIA.sub("", linha).strip()
+        # 5 palavras é o piso de uma frase de conteúdo; abaixo disso é rótulo.
+        if len(linha.split()) < 5 or not _RE_FIM_DE_FRASE.search(linha):
+            continue
+        uteis.append(linha)
+
+    # Linhas idênticas repetidas são navegação/rodapé (a Wikipédia repete o
+    # menu no topo e na barra lateral). Parágrafo real não se repete literal.
+    resultado = "\n".join(dict.fromkeys(uteis)).strip()
+
+    if len(resultado) > limite:
+        # Corta na última palavra inteira, para não entregar sílaba partida.
+        resultado = resultado[:limite].rsplit(" ", 1)[0] + " […texto truncado]"
+    return resultado
+
+
+# Instanciada sem URL fixa: com `website_url` no construtor, o crewai-tools
+# trava a ferramenta naquela página só (mesmo motivo das ferramentas de disco).
+_raspador = ScrapeWebsiteTool()
+
+
+@tool("Ler Página Web")
+def ler_pagina_web(url: str) -> str:
+    """Abre uma URL http/https e devolve o TEXTO da página, sem o menu de
+    navegação e limitado a ~4000 caracteres. Use DEPOIS da 'Busca na Web',
+    para ler de fato a fonte mais confiável que ela retornou (documentação
+    oficial, Wikipédia, artigo) em vez de confiar só no resumo do resultado.
+    Exemplo: 'https://pt.wikipedia.org/wiki/Equilíbrio_de_Nash'."""
+    problema = _url_segura(url)
+    if problema:
+        return f"BLOQUEADO: {problema}"
+
+    try:
+        bruto = _raspador.run(website_url=url.strip())
+    except Exception as erro:
+        # Nunca levanta: o laço ReAct precisa do erro como texto para tentar
+        # outra fonte, igual ao que busca_web e executar_comando já fazem.
+        return f"Não consegui ler a página ({erro}). Tente outra fonte."
+
+    limpo = _enxugar_pagina(bruto or "")
+    if not limpo:
+        return (
+            "A página não devolveu texto legível (pode ser vídeo, PDF ou "
+            "conteúdo carregado por JavaScript). Tente outra fonte."
+        )
+    return f"Conteúdo de {url.strip()}:\n\n{limpo}"
 
 # ---------------------------------------------------------------------------
 # FERRAMENTAS DE DISCO (NÍVEL 1: LER PASTAS E ARQUIVOS LOCAIS)
@@ -479,24 +767,39 @@ def montar_equipe(
         goal=f"Produzir um dossiê rigoroso e verificável sobre: {tema}",
         backstory=(
             "Você é um investigador rigoroso — um CURADOR, não um mero coletor. "
-            "Trabalha com TRÊS fontes e escolhe a certa antes de agir:\n"
+            "Trabalha com QUATRO fontes e escolhe a certa antes de agir:\n"
             "1) DISCO LOCAL (leitura direta) — 'List files in directory' e "
             "'Read a file's content' para listar uma pasta ou ler um arquivo "
             "PEQUENO. Ao citar código, extraia o BLOCO EXATO, sem parafrasear.\n"
             "2) BUSCA SEMÂNTICA ('Busca Semântica na Pasta') — para ENCONTRAR "
             "trechos em arquivos GRANDES ou numa base de código; informe uma "
             "SUBPASTA específica, NUNCA a raiz do projeto.\n"
-            "3) BUSCA NA WEB ('Busca na Web') — informação externa ou atual.\n"
-            f"Só é possível ler/buscar dentro de '{BASE_DIR}'.\n\n"
-            "RIGOR (obrigatório): avalie a CREDIBILIDADE de cada fonte "
-            "(documentação oficial > blog aleatório); descarte especulação; e "
-            "entregue um DOSSIÊ ESTRUTURADO — tópicos, cada um com o achado, a "
-            "FONTE (URL ou caminho do arquivo) e, quando for código, o trecho "
-            "exato. Nunca jogue texto corrido cru para o próximo agente."
+            "3) BUSCA NA WEB ('Busca na Web') — devolve os resultados E JÁ ABRE "
+            "as páginas mais confiáveis, entregando o TEXTO delas num bloco "
+            "'TEXTO DAS FONTES MAIS CONFIÁVEIS'. É desse bloco que saem as "
+            "definições, os nomes e os números que você vai afirmar. Se ele "
+            "vier vazio, refaça a busca ou diga que não encontrou fonte — "
+            "nunca preencha o vazio de memória.\n"
+            "4) LER PÁGINA WEB ('Ler Página Web') — para abrir uma página "
+            "ESPECÍFICA que a busca não leu e você quer conferir.\n\n"
+            f"Só é possível ler/buscar em DISCO dentro de '{BASE_DIR}'.\n\n"
+            "RIGOR (obrigatório): avalie a CREDIBILIDADE de cada fonte; "
+            "descarte especulação; e entregue um DOSSIÊ ESTRUTURADO — tópicos, "
+            "cada um com o achado, a FONTE (URL ou caminho do arquivo) e, "
+            "quando for código, o trecho exato. Nunca jogue texto corrido cru "
+            "para o próximo agente."
         ),
         llm=llm,
-        tools=[busca_web, leitor_pastas, leitor_arquivos, busca_semantica],
-        max_iter=8,  # 4 ferramentas para escolher/encadear
+        tools=[
+            busca_web,
+            ler_pagina_web,
+            leitor_pastas,
+            leitor_arquivos,
+            busca_semantica,
+        ],
+        # 10 e não 8: a web agora exige DOIS passos (buscar, depois ler), e um
+        # link que não devolve texto obriga a tentar o próximo.
+        max_iter=10,
         allow_delegation=False,
         verbose=True,
     )
@@ -636,7 +939,9 @@ def montar_equipe(
             f"'Read a file's content' (padrão: '{BASE_DIR}').\n"
             "- Arquivo grande / base de código: use a 'Busca Semântica na "
             "Pasta' (subpasta específica) e extraia o trecho exato.\n"
-            "- Informação externa/atual: 'Busca na Web'.\n"
+            "- Informação externa/atual: 'Busca na Web' para achar os links e "
+            "em seguida 'Ler Página Web' no melhor deles, para ler o texto. "
+            "Afirmação sem página lida é especulação — não entra no dossiê.\n"
             "- Script simples sem dependência de arquivos: pode pular as "
             "ferramentas e esboçar só a lógica.\n"
             "Avalie a credibilidade das fontes e entregue um DOSSIÊ "
