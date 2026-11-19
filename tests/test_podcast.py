@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import wave
+from datetime import datetime, timezone
 
 import numpy as np
 import pytest
@@ -729,3 +730,102 @@ def test_gerar_podcast_falha_antes_de_sintetizar_se_a_voz_falta(tmp_path):
         podcast.gerar_podcast(
             "A: um\nB: dois", motor=MotorQueSemprePifa(), destino=tmp_path / "ep"
         )
+
+
+# --------------------------------------------------------------------------
+# Funções puras auxiliares (_limpar_para_fala, _tentar_json, _identificador)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "bruto,esperado",
+    [
+        ("**IA** é _incrível_", "IA é incrível"),
+        ("Veja [a doc](https://x.com/doc) agora", "Veja a doc agora"),
+        ("![logo](img.png) Marca", "logo Marca"),
+        ("Rode `pip install` e pronto", "Rode pip install e pronto"),
+        ("Bom dia [pausa] pessoal", "Bom dia pessoal"),
+        ("Olá <break time='1s'/> gente", "Olá gente"),
+        ("  —  texto   com\n\nespaços  -", "texto com espaços"),
+        ("", ""),
+    ],
+)
+def test_limpar_para_fala(bruto, esperado):
+    assert podcast._limpar_para_fala(bruto) == esperado
+
+
+def test_tentar_json_lista_simples():
+    falas = podcast._tentar_json(
+        '[{"speaker": "Ana", "text": "**Oi**"}, {"host": "Bia", "fala": "Olá"}]'
+    )
+    assert falas == [podcast.Fala("Ana", "Oi"), podcast.Fala("Bia", "Olá")]
+
+
+@pytest.mark.parametrize("chave", ["roteiro", "script", "falas", "dialogo", "lines"])
+def test_tentar_json_objeto_com_chave_conhecida(chave):
+    bruto = json.dumps({chave: [{"locutor": " Ana ", "texto": "Oi"}]})
+    assert podcast._tentar_json(bruto) == [podcast.Fala("Ana", "Oi")]
+
+
+def test_tentar_json_ignora_texto_ao_redor():
+    bruto = 'Claro! Aqui está:\n[{"speaker": "Ana", "text": "Oi"}]\nEspero ter ajudado.'
+    assert podcast._tentar_json(bruto) == [podcast.Fala("Ana", "Oi")]
+
+
+def test_tentar_json_pula_itens_invalidos():
+    bruto = json.dumps(
+        [
+            "string solta",
+            {"speaker": "Ana"},                    # sem texto
+            {"speaker": 3, "text": "número"},      # locutor não é string
+            {"speaker": "Bia", "text": "[pausa]"},  # some na limpeza
+            {"speaker": "Caio", "text": "Valeu"},
+        ]
+    )
+    assert podcast._tentar_json(bruto) == [podcast.Fala("Caio", "Valeu")]
+
+
+@pytest.mark.parametrize(
+    "bruto",
+    [
+        "Ana: só texto, sem JSON",
+        "]{ ao contrário [",
+        "[isto não é json]",
+        '{"outra_chave": [{"speaker": "Ana", "text": "Oi"}]}',
+        '{"roteiro": "não é lista"}',
+        "[]",
+        '[{"speaker": "Ana"}]',
+    ],
+)
+def test_tentar_json_devolve_none_quando_nao_aproveita(bruto):
+    assert podcast._tentar_json(bruto) is None
+
+
+class _AgoraFixo:
+    """Congela o relógio do podcast.py para o carimbo ser determinístico."""
+
+    @staticmethod
+    def now():
+        return datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "titulo,esperado",
+    [
+        (None, "episodio_2026-01-02_03-04-05"),
+        ("", "episodio_2026-01-02_03-04-05"),
+        ("Energia Solar no Brasil", "2026-01-02_03-04-05_energia-solar-no-brasil"),
+        ("Ação & Reação: 2ª parte!", "2026-01-02_03-04-05_acao-reacao-2a-parte"),
+        ("../../etc/passwd", "2026-01-02_03-04-05_etc-passwd"),
+        ("???", "2026-01-02_03-04-05_episodio"),
+    ],
+)
+def test_identificador(monkeypatch, titulo, esperado):
+    monkeypatch.setattr(podcast, "datetime", _AgoraFixo)
+    assert podcast._identificador(titulo) == esperado
+
+
+def test_identificador_corta_titulo_longo(monkeypatch):
+    monkeypatch.setattr(podcast, "datetime", _AgoraFixo)
+    nome = podcast._identificador("palavra " * 30)
+    base = nome.split("_", 2)[2]
+    assert len(base) <= 40
+    assert re.fullmatch(r"[a-z0-9-]+", base)

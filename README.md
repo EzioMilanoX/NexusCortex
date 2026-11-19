@@ -230,17 +230,32 @@ python main.py Crie um script da hora e salve como relogio.py   # gera código
 
 Ou como API HTTP (para o n8n / Postman):
 ```bash
-python api.py                    # sobe em http://0.0.0.0:8000
+python api.py                    # sobe em http://127.0.0.1:8000 (só esta máquina)
+python api.py --reload           # idem, recarregando ao editar o código (dev)
 ```
 - `POST /agencia` com `{"tema": "...", "webhook_url": "http://... (opcional)"}`
   responde **na hora** com um `job_id` (não trava o n8n); a equipe roda em
   background e, ao terminar, dispara um POST no `webhook_url`.
 - `GET /status/{job_id}` acompanha por polling; quando `status` é
   `concluido`, traz `arquivo_salvo` e `conteudo`.
-- **Segurança/limites:** `host="0.0.0.0"` expõe na rede local sem
-  autenticação — se o n8n roda na mesma máquina, prefira `127.0.0.1`. Rode
-  com **um único worker** (o registro de jobs é em memória); reiniciar o
-  servidor perde os jobs em andamento.
+- **Host, porta e reload** são configuráveis — argumento de linha de
+  comando vence variável de ambiente, que vence o padrão:
+
+  | Argumento | Variável | Padrão |
+  |---|---|---|
+  | `--host` | `NCX_HOST` | `127.0.0.1` (só esta máquina) |
+  | `--port` | `NCX_PORT` | `8000` |
+  | `--reload` / `--no-reload` | `NCX_RELOAD` (`1`/`true`/`sim`) | desligado |
+
+- **Segurança:** a API **não tem autenticação** e `POST /agencia` aciona um
+  agente com acesso ao terminal. Por isso ela escuta só no loopback por
+  padrão. Para acessar de outro dispositivo (ou de um n8n em outra máquina),
+  abra de propósito — `python api.py --host 0.0.0.0` ou `NCX_HOST=0.0.0.0` —
+  e só numa rede confiável: o servidor imprime um aviso no boot sempre que o
+  host sai do loopback. Se o n8n roda na mesma máquina, o padrão já basta.
+- **Limites:** rode com **um único worker** (o registro de jobs é em
+  memória); reiniciar o servidor (inclusive pelo `--reload`) perde os jobs
+  em andamento.
 
 ### Atalho de um clique (o jeito mais fácil)
 
@@ -371,9 +386,10 @@ python podcast.py roteiro.txt --motor tom      # demonstração, sem baixar voz
 | `GET /podcast/ambiente` | diagnóstico de Ollama e FFmpeg |
 
 > **Trilha de fundo:** passe o caminho de um `.wav` **dentro da pasta do
-> projeto**. Caminhos fora dela são recusados de propósito — a API escuta em
-> `0.0.0.0` sem autenticação, e um caminho arbitrário no corpo do POST não
-> pode virar leitura de qualquer arquivo do disco.
+> projeto**. Caminhos fora dela são recusados de propósito — a API não tem
+> autenticação (e pode ter sido aberta para a rede com `NCX_HOST`), então um
+> caminho arbitrário no corpo do POST não pode virar leitura de qualquer
+> arquivo do disco.
 
 ### Dentro do VS Code (Continue.dev / Cline) — endpoint OpenAI-compatível
 

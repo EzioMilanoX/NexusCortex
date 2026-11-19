@@ -11,8 +11,19 @@ Duas faces para o mesmo cérebro:
 Não altera nada em main.py — só importa o que já existe lá.
 
 Uso:
-  python api.py
-  (ou, sem reload)  uvicorn api:app --host 0.0.0.0 --port 8000
+  python api.py                         # http://127.0.0.1:8000, sem reload
+  python api.py --reload                # recarrega ao editar o código (dev)
+  python api.py --host 0.0.0.0          # expõe na rede local (ver aviso abaixo)
+  (equivalente) uvicorn api:app --host 127.0.0.1 --port 8000
+
+Configuração do servidor (CLI vence variável de ambiente, que vence o padrão):
+  --host   / NCX_HOST    padrão 127.0.0.1 (só esta máquina)
+  --port   / NCX_PORT    padrão 8000
+  --reload / NCX_RELOAD  padrão desligado (1/true/sim/on liga)
+
+SEGURANÇA: não há autenticação, e POST /agencia aciona um agente com acesso
+ao terminal. Por isso o padrão é loopback; um host fora dele (0.0.0.0, IP da
+LAN) entrega esse terminal a qualquer um na rede e o servidor avisa no boot.
 
 Endpoints:
   POST /agencia                 {"tema": "...", "webhook_url": "http://... (opcional)"}
@@ -27,14 +38,17 @@ Endpoints:
 
 from __future__ import annotations
 
+import argparse
+import ipaddress
 import json
+import os
 import shutil
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 
 from pathlib import Path
@@ -326,10 +340,10 @@ WEB_DIR = estudio.BASE_DIR / "web"
 def _caminho_de_projeto(bruto: str, sufixos: tuple[str, ...]) -> Path:
     """Resolve um caminho vindo do cliente e recusa qualquer um fora do projeto.
 
-    Mesmo princípio do sandbox de terminal do main.py: a API escuta em
-    0.0.0.0 sem autenticação, então um caminho arbitrário no corpo do POST
-    não pode virar leitura de qualquer arquivo do disco. `resolve()` fecha o
-    buraco de "..\\" e de symlink.
+    Mesmo princípio do sandbox de terminal do main.py: a API não tem
+    autenticação (e pode ter sido aberta para a rede com NCX_HOST), então um
+    caminho arbitrário no corpo do POST não pode virar leitura de qualquer
+    arquivo do disco. `resolve()` fecha o buraco de "..\\" e de symlink.
     """
     alvo = Path(bruto)
     alvo = (estudio.BASE_DIR / alvo).resolve() if not alvo.is_absolute() else alvo.resolve()
@@ -914,10 +928,85 @@ def nexus_assist(pedido: NexusAssist):
     }
 
 
+# ---------------------------------------------------------------------------
+# CONFIGURAÇÃO DO SERVIDOR (host / porta / reload)
+# ---------------------------------------------------------------------------
+# O padrão é loopback e sem reload. Antes era host="0.0.0.0" + reload=True
+# fixos: qualquer aparelho da rede local alcançava /agencia — um agente com
+# terminal — sem senha nenhuma. Abrir para a rede agora é escolha explícita.
+HOST_PADRAO = "127.0.0.1"
+PORTA_PADRAO = 8000
+_VERDADEIROS = frozenset({"1", "true", "sim", "s", "yes", "y", "on"})
+
+
+def _env_booleana(valor: str | None) -> bool:
+    return (valor or "").strip().lower() in _VERDADEIROS
+
+
+def host_e_loopback(host: str) -> bool:
+    """True se o host só aceita conexões desta máquina."""
+    host = host.strip().strip("[]")
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False  # nome de host qualquer: na dúvida, trata como exposto
+
+
+def configuracao_servidor(
+    argv: Sequence[str] | None = None, ambiente: Mapping[str, str] | None = None
+) -> argparse.Namespace:
+    """Resolve host/porta/reload: argumento de linha de comando > variável de
+    ambiente (NCX_HOST, NCX_PORT, NCX_RELOAD) > padrão seguro."""
+    ambiente = os.environ if ambiente is None else ambiente
+    parser = argparse.ArgumentParser(
+        prog="python api.py", description="Sobe a API do Cortexus."
+    )
+    parser.add_argument(
+        "--host",
+        default=ambiente.get("NCX_HOST") or HOST_PADRAO,
+        help=f"interface de escuta (env NCX_HOST; padrão {HOST_PADRAO}). "
+        "0.0.0.0 expõe na rede local SEM autenticação.",
+    )
+    # argparse aplica o `type` também ao default em string: um NCX_PORT
+    # inválido cai no mesmo erro amigável que um --port inválido.
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=ambiente.get("NCX_PORT") or str(PORTA_PADRAO),
+        help=f"porta (env NCX_PORT; padrão {PORTA_PADRAO})",
+    )
+    parser.add_argument(
+        "--reload",
+        action=argparse.BooleanOptionalAction,
+        default=_env_booleana(ambiente.get("NCX_RELOAD")),
+        help="recarrega ao editar o código — só para desenvolvimento "
+        "(env NCX_RELOAD; padrão desligado)",
+    )
+    return parser.parse_args(argv)
+
+
+def aviso_de_exposicao(host: str, porta: int) -> str | None:
+    """Mensagem de alerta quando o host sai do loopback; None se é seguro."""
+    if host_e_loopback(host):
+        return None
+    return (
+        "\n"
+        "!!! ATENÇÃO: a API do Cortexus vai escutar em "
+        f"{host}:{porta}, FORA do loopback.\n"
+        "!!! Não há autenticação: qualquer aparelho que alcance esta máquina\n"
+        "!!! pode chamar POST /agencia — um agente com acesso ao TERMINAL.\n"
+        "!!! Use só numa rede confiável e com firewall. Para voltar ao modo\n"
+        f"!!! seguro, remova NCX_HOST / --host (padrão {HOST_PADRAO}).\n"
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    # reload_excludes é essencial: a agência GRAVA arquivos em output/
+    # Reload é opt-in (--reload / NCX_RELOAD). Ligado, reload_excludes é
+    # essencial: a agência GRAVA arquivos em output/
     # (inclusive .py) no meio do job — sem a exclusão, o watcher do reload
     # reiniciaria o servidor e MATARIA o próprio job que gerou o arquivo.
     # Detalhes que importam (verificados no código do uvicorn):
@@ -927,11 +1016,15 @@ if __name__ == "__main__":
     #     sem ele o fallback StatReload ignora excludes.
     #   - NUNCA rode com workers>1: o registro de jobs é em memória, por
     #     processo. E todo reload/restart perde os jobs em andamento.
+    config = configuracao_servidor()
+    aviso = aviso_de_exposicao(config.host, config.port)
+    if aviso:
+        print(aviso, flush=True)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # o diretório precisa existir no boot
-    uvicorn.run(
-        "api:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        reload_excludes=["output", "output/*"],
+    opcoes_reload = (
+        {"reload": True, "reload_excludes": ["output", "output/*"]}
+        if config.reload
+        else {}
     )
+    uvicorn.run("api:app", host=config.host, port=config.port, **opcoes_reload)

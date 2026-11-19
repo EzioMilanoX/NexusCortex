@@ -72,7 +72,9 @@ botão de download e um expander **"Ver Payload da API (Para n8n)"**.
 
 ### 2.3. API HTTP (para o n8n / automação)
 
-Com `python api.py` no ar:
+Com `python api.py` no ar (escuta em `http://127.0.0.1:8000` — só esta
+máquina; `--port`/`NCX_PORT` muda a porta e `--reload` liga o recarregamento
+para desenvolvimento):
 - `POST /agencia` com `{"tema": "...", "webhook_url": "http://... (opcional)"}`
   responde **na hora** com um `job_id` (não trava o n8n); a equipe roda no
   fundo e, ao terminar, dispara um POST no `webhook_url`.
@@ -85,6 +87,17 @@ curl -X POST http://localhost:8000/agencia \
   -H "Content-Type: application/json" \
   -d '{"tema": "Pesquise novidades do FastAPI e resuma"}'
 ```
+
+**Acessar de outro dispositivo (celular, outro PC, n8n em outra máquina):**
+por padrão a API **não** aceita conexões de fora — ela não tem senha e o
+`/agencia` comanda um agente com acesso ao terminal. Se precisar, abra de
+propósito e só numa rede confiável:
+```bash
+python api.py --host 0.0.0.0          # ou: NCX_HOST=0.0.0.0 python api.py
+```
+O servidor imprime um aviso no boot; depois acesse por
+`http://<IP-desta-máquina>:8000`. Os atalhos (`cortexus.bat`/`estudio.bat` e
+os `.sh`) sobem sempre em `127.0.0.1`.
 
 ### 2.4. Dentro do VS Code (Continue.dev / Cline)
 

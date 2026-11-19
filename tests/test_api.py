@@ -200,6 +200,9 @@ class _LLMFalso:
 @pytest.fixture
 def studio(client, tmp_path, monkeypatch):
     monkeypatch.setattr(api.estudio, "PODCAST_DIR", tmp_path / "podcast")
+    # Sem FFmpeg de verdade: com ele no PATH a suíte dispararia um subprocesso
+    # por episódio (lento e dependente da máquina). O episódio sai em WAV.
+    monkeypatch.setattr(api.estudio, "exportar_mp3", lambda *a, **k: None)
     falso = _LLMFalso()
     monkeypatch.setattr(api, "criar_llm", lambda: falso)
     client.llm_falso = falso          # o teste alcança os prompts por aqui
@@ -427,3 +430,372 @@ def test_estudio_serve_o_html(studio):
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
     assert "Estúdio de Podcast" in r.text
+
+
+# --- mais cobertura das rotas do estúdio (tudo offline) -------------------
+class _MotorFalso(api.estudio.MotorTom):
+    """Finge ser o Piper: aceita qualquer voz e sintetiza um tom.
+
+    Exercita o caminho do motor de PRODUÇÃO (validação no POST + síntese no
+    background) sem piper-tts instalado e sem os .onnx em disco."""
+
+    nome = "piper"
+
+    def __init__(self):
+        super().__init__()
+        self.sintetizadas: list[str] = []
+
+    def verificar(self, apresentadores):
+        return None
+
+    def sintetizar(self, texto, apresentador, destino):
+        self.sintetizadas.append(texto)
+        return super().sintetizar(texto, apresentador, destino)
+
+
+def test_podcast_motor_piper_stubado_gera_episodio(studio, monkeypatch):
+    motor = _MotorFalso()
+    monkeypatch.setattr(api.estudio, "criar_motor", lambda *a, **k: motor)
+    r = studio.post("/podcast", json={"roteiro": ROTEIRO_FAKE, "motor": "piper"})
+    assert r.status_code == 200
+
+    job = studio.get(f"/status/{r.json()['job_id']}").json()
+    assert job["status"] == "concluido", job.get("detalhe")
+    assert job["motor"] == "piper"
+    assert len(motor.sintetizadas) == 2
+    assert job["arquivo_mp3"] is None and "FFmpeg" in job["aviso_mp3"]
+
+
+def test_podcast_por_tema_em_blocos_gera_audio(studio_pauta):
+    """O caminho completo do POST /podcast por tema (modo padrão): pauta da
+    crew (mockada) -> blocos do LLM (falso) -> síntese 'tom'."""
+    r = studio_pauta.post("/podcast", json={"tema": "teoria dos jogos", "motor": "tom"})
+    job = studio_pauta.get(f"/status/{r.json()['job_id']}").json()
+    assert job["status"] == "concluido", job.get("detalhe")
+    assert job["origem_roteiro"] == "crew" and job["blocos"] == 3
+    assert job["total_falas"] == 6
+    assert job["audio_em"] == f"/podcast/{job['job_id']}/audio"
+
+
+def test_podcast_dispara_webhook_ao_concluir(studio, monkeypatch):
+    recebidos: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        api, "_disparar_webhook", lambda url, payload: recebidos.append((url, payload))
+    )
+    r = studio.post(
+        "/podcast",
+        json={"roteiro": ROTEIRO_FAKE, "motor": "tom", "webhook_url": "http://n8n/x"},
+    )
+    job_id = r.json()["job_id"]
+    assert recebidos and recebidos[0][0] == "http://n8n/x"
+    assert recebidos[0][1]["status"] == "concluido"
+    assert recebidos[0][1]["job_id"] == job_id
+    assert studio.get(f"/status/{job_id}").json()["webhook_entregue"] is True
+
+
+def test_podcast_recusa_webhook_sem_http(studio):
+    r = studio.post(
+        "/podcast",
+        json={"roteiro": ROTEIRO_FAKE, "motor": "tom", "webhook_url": "file:///etc"},
+    )
+    assert r.status_code == 400
+
+
+def test_podcast_roteiro_por_tema_devolve_texto_normalizado(studio, monkeypatch):
+    bruto = "**Host1:** Olá, [risos] tudo bem?\nHost2: Tudo ótimo, e você?"
+    monkeypatch.setattr(
+        api,
+        "_gerar_resultado",
+        lambda *a, **k: {**RESULTADO_FAKE, "conteudo_limpo": bruto},
+    )
+    r = studio.post("/podcast/roteiro", json={"tema": "x", "modo": "unico"})
+    assert r.status_code == 200 and "job_id" in r.json()
+    job = studio.get(f"/status/{r.json()['job_id']}").json()
+    assert job["status"] == "concluido", job.get("detalhe")
+    assert job["roteiro_bruto"] == bruto
+    # O que volta para o editor já passou pelo parser: sem markdown nem rubrica.
+    assert "**" not in job["roteiro"] and "[risos]" not in job["roteiro"]
+    assert job["total_falas"] == 2
+
+
+def test_podcast_roteiro_exige_ollama(studio, monkeypatch):
+    monkeypatch.setattr(api, "diagnostico_ollama", lambda: "Ollama fora do ar")
+    assert studio.post("/podcast/roteiro", json={"tema": "x"}).status_code == 503
+
+
+def test_podcast_roteiro_minutos_fora_da_faixa(studio):
+    r = studio.post("/podcast/roteiro", json={"tema": "x", "minutos": 0})
+    assert r.status_code == 400
+
+
+def test_podcast_audio_prefere_o_mp3(studio, monkeypatch):
+    def _mp3_falso(wav, destino=None, **k):
+        mp3 = wav.with_suffix(".mp3")
+        mp3.write_bytes(b"ID3" + b"\x00" * 64)
+        return mp3
+
+    monkeypatch.setattr(api.estudio, "exportar_mp3", _mp3_falso)
+    r = studio.post("/podcast", json={"roteiro": ROTEIRO_FAKE, "motor": "tom"})
+    audio = studio.get(f"/podcast/{r.json()['job_id']}/audio")
+    assert audio.status_code == 200
+    assert audio.headers["content-type"] == "audio/mpeg"
+    assert audio.content.startswith(b"ID3")
+
+
+def test_podcast_audio_arquivo_apagado_da_404(studio, tmp_path):
+    job_id = api._registrar_job("x", tipo="podcast")
+    api._atualizar_job(
+        job_id, status="concluido", arquivo_wav=str(tmp_path / "sumiu.wav")
+    )
+    assert studio.get(f"/podcast/{job_id}/audio").status_code == 404
+
+
+def test_vozes_reflete_o_que_esta_em_disco(studio, tmp_path, monkeypatch):
+    monkeypatch.setattr(api.estudio, "VOZES_DIR", tmp_path)
+    (tmp_path / "pt_BR-faber-medium.onnx").write_bytes(b"")
+    d = studio.get("/podcast/vozes").json()
+    baixadas = {v["id"] for v in d["vozes"] if v["baixada"]}
+    assert baixadas == {"pt_BR-faber-medium"}
+    assert d["pasta"] == str(tmp_path)
+    assert "tom" in d["motores"] and "piper" in d["motores"]
+
+
+def test_ambiente_ollama_fora_e_sem_ffmpeg(studio, monkeypatch):
+    monkeypatch.setattr(api, "diagnostico_ollama", lambda: "Ollama fora do ar")
+    monkeypatch.setattr(api.shutil, "which", lambda nome: None)
+    d = studio.get("/podcast/ambiente").json()
+    assert d == {
+        "ollama_ok": False,
+        "ollama_detalhe": "Ollama fora do ar",
+        "ffmpeg": False,
+    }
+
+
+def test_estudio_sem_a_pagina_da_404(studio, tmp_path, monkeypatch):
+    monkeypatch.setattr(api, "WEB_DIR", tmp_path)
+    assert studio.get("/estudio").status_code == 404
+
+
+# --------------------------------------------------------------------------
+# _caminho_de_projeto — guarda contra path traversal
+#
+# A raiz do "projeto" é trocada por uma pasta temporária: assim os arquivos de
+# teste não sujam o repositório e dá para criar alvos FORA da raiz de verdade.
+# --------------------------------------------------------------------------
+@pytest.fixture
+def projeto(tmp_path, monkeypatch):
+    raiz = (tmp_path / "proj").resolve()
+    (raiz / "trilhas").mkdir(parents=True)
+    (raiz / "trilhas" / "fundo.wav").write_bytes(b"RIFF")
+    (raiz / "trilhas" / "ALTO.WAV").write_bytes(b"RIFF")
+    (tmp_path / "segredo.wav").write_bytes(b"RIFF")
+    # Irmã com o MESMO prefixo: pega quem comparasse caminhos como string.
+    (tmp_path / "proj_vizinho").mkdir()
+    (tmp_path / "proj_vizinho" / "x.wav").write_bytes(b"RIFF")
+    monkeypatch.setattr(api.estudio, "BASE_DIR", raiz)
+    return raiz
+
+
+def test_caminho_de_projeto_aceita_relativo_dentro(projeto):
+    alvo = api._caminho_de_projeto("trilhas/fundo.wav", (".wav",))
+    assert alvo == projeto / "trilhas" / "fundo.wav"
+
+
+def test_caminho_de_projeto_aceita_absoluto_dentro(projeto):
+    absoluto = str(projeto / "trilhas" / "fundo.wav")
+    assert api._caminho_de_projeto(absoluto, (".wav",)).is_file()
+
+
+def test_caminho_de_projeto_extensao_ignora_caixa(projeto):
+    assert api._caminho_de_projeto("trilhas/ALTO.WAV", (".wav",)).is_file()
+
+
+@pytest.mark.parametrize(
+    "bruto",
+    [
+        "../segredo.wav",                 # sobe um nível
+        "trilhas/../../segredo.wav",      # desce e sobe além da raiz
+        "../proj_vizinho/x.wav",          # prefixo igual, pasta irmã
+        ".",                              # a própria raiz não é arquivo
+    ],
+)
+def test_caminho_de_projeto_recusa_quem_escapa(projeto, bruto):
+    with pytest.raises(api.HTTPException) as erro:
+        api._caminho_de_projeto(bruto, (".wav",))
+    assert erro.value.status_code == 400
+
+
+@pytest.mark.skipif(api.os.name != "nt", reason="barra invertida só separa no Windows")
+def test_caminho_de_projeto_recusa_barra_invertida_do_windows(projeto):
+    with pytest.raises(api.HTTPException) as erro:
+        api._caminho_de_projeto("..\\segredo.wav", (".wav",))
+    assert erro.value.status_code == 400
+
+
+def test_caminho_de_projeto_recusa_absoluto_fora(projeto):
+    fora = str(projeto.parent / "segredo.wav")
+    with pytest.raises(api.HTTPException) as erro:
+        api._caminho_de_projeto(fora, (".wav",))
+    assert erro.value.status_code == 400 and "fora" in erro.value.detail.lower()
+
+
+def test_caminho_de_projeto_recusa_symlink_para_fora(projeto):
+    link = projeto / "trilhas" / "atalho.wav"
+    try:
+        link.symlink_to(projeto.parent / "segredo.wav")
+    except (OSError, NotImplementedError):
+        pytest.skip("sem permissão para criar symlink nesta máquina")
+    with pytest.raises(api.HTTPException) as erro:
+        api._caminho_de_projeto("trilhas/atalho.wav", (".wav",))
+    assert erro.value.status_code == 400
+
+
+def test_caminho_de_projeto_extensao_errada_e_ausente(projeto):
+    (projeto / "notas.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(api.HTTPException) as errada:
+        api._caminho_de_projeto("notas.txt", (".wav",))
+    assert errada.value.status_code == 400
+    with pytest.raises(api.HTTPException) as ausente:
+        api._caminho_de_projeto("trilhas/nao_existe.wav", (".wav",))
+    assert ausente.value.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# _escrever_em_blocos — chamado direto, com crew e LLM falsos
+# --------------------------------------------------------------------------
+@pytest.fixture
+def blocos(monkeypatch):
+    """Crew devolvendo a PAUTA_FAKE e um LLM falso; guarda o que a crew recebeu."""
+    chamadas_crew: list[dict] = []
+
+    def _crew(prompt, **kwargs):
+        chamadas_crew.append({"prompt": prompt, **kwargs})
+        return {
+            **RESULTADO_FAKE,
+            "conteudo_limpo": PAUTA_FAKE,
+            "arquivo": "output/pauta.txt",
+        }
+
+    falso = _LLMFalso()
+    monkeypatch.setattr(api, "_gerar_resultado", _crew)
+    monkeypatch.setattr(api, "criar_llm", lambda: falso)
+    return chamadas_crew, falso
+
+
+def _rodar_blocos(**campos):
+    pedido = api.PedidoPodcast(**{"tema": "teoria dos jogos", "minutos": 5, **campos})
+    job_id = api._registrar_job(pedido.tema, tipo="roteiro")
+    saida = api._escrever_em_blocos(job_id, pedido, api.estudio.APRESENTADORES_PADRAO)
+    return job_id, saida
+
+
+def test_escrever_em_blocos_devolve_o_contrato(blocos):
+    _, falso = blocos
+    job_id, saida = _rodar_blocos()
+    assert set(saida) == {"falas", "bruto", "pauta", "blocos", "arquivo_roteiro"}
+    assert saida["blocos"] == 3 and len(falso.prompts) == 3
+    assert saida["pauta"] == PAUTA_FAKE
+    assert saida["arquivo_roteiro"] == "output/pauta.txt"
+    assert len(saida["falas"]) == 6
+    assert all(isinstance(f, api.estudio.Fala) for f in saida["falas"])
+    # O bruto junta os blocos com linha em branco, na ordem.
+    assert saida["bruto"].count("\n\n") == 2
+    assert saida["bruto"].index("bloco numero 1") < saida["bruto"].index("bloco numero 3")
+    job = api._jobs[job_id]
+    assert job["status"] == "escrevendo_roteiro" and job["etapa"] == "bloco 3 de 3"
+
+
+def test_escrever_em_blocos_repassa_contexto_e_memoria_a_crew(blocos):
+    chamadas_crew, _ = blocos
+    _rodar_blocos(contexto_extra="anexo do usuário", usar_memoria=True)
+    assert len(chamadas_crew) == 1                 # a pesquisa roda UMA vez
+    assert chamadas_crew[0]["contexto_extra"] == "anexo do usuário"
+    assert chamadas_crew[0]["usar_memoria"] is True
+
+
+def test_escrever_em_blocos_marca_o_bloco_que_falhou(blocos, monkeypatch):
+    class _LLMQueFalhaNoPrimeiro(_LLMFalso):
+        def call(self, mensagens, **kwargs):
+            if not self.prompts:
+                self.prompts.append("falhou")
+                raise RuntimeError("timeout do Ollama")
+            return super().call(mensagens, **kwargs)
+
+    monkeypatch.setattr(api, "criar_llm", _LLMQueFalhaNoPrimeiro)
+    _, saida = _rodar_blocos()
+    assert saida["bruto"].startswith("[bloco 1 falhou: timeout do Ollama]")
+    assert len(saida["falas"]) == 4                 # blocos 2 e 3 sobreviveram
+
+
+def test_escrever_em_blocos_pauta_curta_limita_as_chamadas(blocos, monkeypatch):
+    _, falso = blocos
+    pauta_curta = "1. Abertura | um fato\n2. Fecho | outro fato\n"
+    monkeypatch.setattr(
+        api,
+        "_gerar_resultado",
+        lambda *a, **k: {**RESULTADO_FAKE, "conteudo_limpo": pauta_curta},
+    )
+    _, saida = _rodar_blocos(minutos=10)
+    assert saida["blocos"] == 2 and len(falso.prompts) == 2
+
+
+# --------------------------------------------------------------------------
+# Configuração do servidor (host / porta / reload)
+# --------------------------------------------------------------------------
+def test_servidor_padrao_e_loopback_sem_reload(monkeypatch):
+    for var in ("NCX_HOST", "NCX_PORT", "NCX_RELOAD"):
+        monkeypatch.delenv(var, raising=False)
+    config = api.configuracao_servidor([])        # lê o os.environ de verdade
+    assert config.host == "127.0.0.1"
+    assert config.port == 8000
+    assert config.reload is False
+    assert api.aviso_de_exposicao(config.host, config.port) is None
+
+
+def test_servidor_le_variaveis_de_ambiente():
+    config = api.configuracao_servidor(
+        [], {"NCX_HOST": "0.0.0.0", "NCX_PORT": "9001", "NCX_RELOAD": "sim"}
+    )
+    assert (config.host, config.port, config.reload) == ("0.0.0.0", 9001, True)
+
+
+def test_servidor_linha_de_comando_vence_o_ambiente():
+    config = api.configuracao_servidor(
+        ["--host", "127.0.0.1", "--port", "8100", "--no-reload"],
+        {"NCX_HOST": "0.0.0.0", "NCX_PORT": "9001", "NCX_RELOAD": "1"},
+    )
+    assert (config.host, config.port, config.reload) == ("127.0.0.1", 8100, False)
+
+
+def test_servidor_variavel_vazia_cai_no_padrao():
+    config = api.configuracao_servidor(
+        [], {"NCX_HOST": "", "NCX_PORT": "", "NCX_RELOAD": "0"}
+    )
+    assert (config.host, config.port, config.reload) == ("127.0.0.1", 8000, False)
+
+
+def test_servidor_porta_invalida_da_erro_amigavel():
+    with pytest.raises(SystemExit):
+        api.configuracao_servidor([], {"NCX_PORT": "oito mil"})
+
+
+@pytest.mark.parametrize(
+    "host,loopback",
+    [
+        ("127.0.0.1", True),
+        ("localhost", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("0.0.0.0", False),
+        ("::", False),
+        ("192.168.0.10", False),
+        ("minha-maquina.local", False),   # nome qualquer: na dúvida, exposto
+    ],
+)
+def test_host_e_loopback(host, loopback):
+    assert api.host_e_loopback(host) is loopback
+
+
+def test_aviso_quando_sai_do_loopback():
+    aviso = api.aviso_de_exposicao("0.0.0.0", 8000)
+    assert aviso and "0.0.0.0:8000" in aviso and "/agencia" in aviso
