@@ -1,0 +1,18 @@
+# Lint do NexusCortex — mesmo padrão da OuroborosEngine/BulletHell.
+#
+# Regras fixadas: o ruff 0.16 ampliou o conjunto padrão (BLE, DTZ, UP, I, RUF,
+# SIM...) e o `ruff check .` sem configuração acusava dezenas de avisos de
+# estilo num código que nunca os seguiu. Ficamos com o conjunto clássico —
+# erros de sintaxe/import (E4, E7, E9) e pyflakes (F): pegam bug de verdade
+# (import morto, variável nunca usada, nome indefinido) sem reescrever o
+# projeto. Linha longa (E501) fica de fora: os prompts dos agentes são
+# strings longas de propósito.
+target-version = "py312"
+line-length = 125
+
+# output/ recebe os scripts que a própria agência GERA (ex.: relogio.py) —
+# não é código do projeto e não pode quebrar o lint. vozes/ só tem .onnx.
+extend-exclude = ["output", "vozes"]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
