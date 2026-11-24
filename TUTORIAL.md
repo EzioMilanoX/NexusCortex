@@ -188,6 +188,29 @@ python nexus_bridge.py --documentar "o módulo de crossfade do player"
 ```
 O relatório sai no terminal (stdout). Endpoint por trás: `POST /v1/nexus-assist`.
 
+### 2.7. Revisão semanal dos projetos e Crítico de Texto
+
+A **revisão semanal** (conceito SYS-16 R.E.C.A.P.) lê o `git log` da semana de
+cada pasta em `PersonalProjects` e a linha dela no `PROJECTS.md`; o Revisor de
+Projetos escreve o relatório, o Crítico de Texto o confere contra os commits
+e, com `--roteiro`, o Roteirista o transforma em falas para o Estúdio:
+```bash
+python recap.py --so-coletar      # confira os dados primeiro (não usa o Ollama)
+python recap.py                   # output/recap/recap_<data>.md
+python recap.py --roteiro         # output/recap/recap_roteiro_<data>.txt
+python podcast.py output/recap/recap_roteiro_<data>.txt --motor piper   # narra
+```
+Outra pasta de projetos: `--raiz` ou a variável `NCX_PROJETOS`.
+
+O **Crítico de Texto** revisa qualquer texto pronto (roteiro, README,
+blueprint) e devolve `## Problemas encontrados` + `## Versão revisada` em
+`output/critica/`. Com `--referencia`, confere os fatos contra ela:
+```bash
+python critica.py README.md --foco "para quem chega agora"
+python critica.py roteiro.txt --referencia pauta.md
+```
+Pela API: `GET /recap/coleta`, `POST /recap`, `POST /critica` (job + `/status`).
+
 ---
 
 ## 3. Como a agência pensa (bom saber)
@@ -222,6 +245,7 @@ mockadas). Cobre a camada determinística (classificação, limpeza, nomes de
 arquivo, rede de segurança, sandbox) e o contrato HTTP.
 ```bash
 pytest
+ruff check .     # lint (config em ruff.toml)
 ```
 O que a suíte **não** cobre (de propósito): a qualidade da saída do modelo
 Qwen em si — isso é avaliação manual, não teste automatizado.

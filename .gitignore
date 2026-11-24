@@ -18,6 +18,10 @@ output/*.txt
 # WAV; nada disso pode entrar no histórico do git.
 output/podcast/
 
+# Revisões semanais (recap.py) e críticas (critica.py) — saídas pessoais.
+output/recap/
+output/critica/
+
 # Vozes do Piper (~63 MB cada .onnx). São baixadas sob demanda com
 # 'python -m piper.download_voices' — ver README.
 vozes/

@@ -32,6 +32,9 @@ Endpoints:
   GET  /podcast/vozes           catálogo pt-BR e quais vozes já estão em disco
   GET  /podcast/{job_id}/audio  o episódio pronto (MP3, ou WAV se faltar FFmpeg)
   GET  /estudio                 o painel HTML do Estúdio de Podcast
+  GET  /recap/coleta?dias=7     dados da semana coletados do git (sem Ollama)
+  POST /recap                   {"dias": 7, "formato": "relatorio"|"roteiro"} -> job
+  POST /critica                 {"texto": ..., "foco": ..., "referencia": ...} -> job
   POST /v1/chat/completions     fachada OpenAI (streaming SSE) — para editores
   GET  /v1/models               lista o modelo "cortexus-crew"
 """
@@ -57,7 +60,9 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+import critica
 import podcast as estudio
+import recap
 from main import (
     OUTPUT_DIR,
     TEMA_PADRAO,
@@ -925,6 +930,149 @@ def nexus_assist(pedido: NexusAssist):
         "arquivo_salvo": res["arquivo"],
         "tipo_saida": res["tipo"],      # 'codigo' | 'analise'
         "linguagem": res["linguagem"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# ESPECIALISTAS — revisão semanal (R.E.C.A.P.) e Crítico de Texto
+# ---------------------------------------------------------------------------
+# Mesmo contrato do /agencia: responde na hora com job_id, roda em background,
+# /status acompanha e o webhook (opcional) recebe o resultado.
+class PedidoRecap(BaseModel):
+    dias: int = 7
+    formato: str = "relatorio"  # "relatorio" | "roteiro" (para o /podcast)
+    minutos: int = 5            # só no formato "roteiro"
+    webhook_url: str | None = None
+
+
+class PedidoCritica(BaseModel):
+    texto: str
+    foco: str = ""
+    referencia: str = ""
+    webhook_url: str | None = None
+
+
+def _rodar_especialista(job_id: str, webhook_url: str | None, gerar) -> None:
+    """Executa `gerar()` em background e grava o resultado no job.
+
+    Compartilhado por /recap e /critica: os dois devolvem um dict com
+    `conteudo` e `arquivo`; o resto dos campos (parados, roteiro...) vai junto.
+    """
+    _atualizar_job(job_id, status="executando")
+    try:
+        res = dict(gerar())
+        campos = {"arquivo_salvo": res.pop("arquivo"), **res}
+        _atualizar_job(
+            job_id,
+            status="concluido",
+            terminado_em=datetime.now().isoformat(timespec="seconds"),
+            **campos,
+        )
+        payload = {"job_id": job_id, "status": "concluido", **campos}
+    except Exception as erro:
+        _atualizar_job(
+            job_id,
+            status="erro",
+            detalhe=str(erro),
+            terminado_em=datetime.now().isoformat(timespec="seconds"),
+        )
+        payload = {"job_id": job_id, "status": "erro", "detalhe": str(erro)}
+
+    if webhook_url:
+        erro_webhook = _disparar_webhook(webhook_url, payload)
+        _atualizar_job(
+            job_id,
+            webhook_entregue=(erro_webhook is None),
+            webhook_detalhe=erro_webhook,
+        )
+
+
+def _validar_dias(dias: int) -> None:
+    if not 1 <= dias <= recap.DIAS_MAX:
+        raise HTTPException(
+            status_code=400, detail=f"dias deve ficar entre 1 e {recap.DIAS_MAX}."
+        )
+
+
+@app.get("/recap/coleta")
+def previa_recap(dias: int = 7):
+    """Só a metade determinística: o que o git diz da semana. Não usa o
+    Ollama — serve para conferir os dados antes de gastar minutos de GPU.
+
+    A pasta é a configurada NO SERVIDOR (NCX_PROJETOS ou a pasta-mãe); o
+    cliente não escolhe caminho, porque a API não tem autenticação."""
+    _validar_dias(dias)
+    raiz = recap.raiz_padrao()
+    try:
+        estados = recap.coletar_estado(raiz, dias)
+    except recap.ErroRecap as erro:
+        raise HTTPException(status_code=404, detail=str(erro)) from erro
+    return {
+        "raiz": str(raiz),
+        "dias": dias,
+        "resumo": recap.resumo_para_prompt(estados, dias),
+        "projetos": [e.como_dict() for e in estados],
+        "parados": [e.nome for e in estados if e.parado],
+    }
+
+
+@app.post("/recap")
+def executar_recap(pedido: PedidoRecap, tarefas: BackgroundTasks):
+    """Revisão semanal: Revisor de Projetos -> Crítico (-> Roteirista).
+
+    Com formato "roteiro", o job concluído traz `roteiro` já normalizado pelo
+    parser do Estúdio — basta mandá-lo em POST /podcast {"roteiro": ...}."""
+    _validar_webhook(pedido.webhook_url)
+    _validar_dias(pedido.dias)
+    if pedido.formato not in recap.FORMATOS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"formato deve ser um de: {', '.join(recap.FORMATOS)}.",
+        )
+    if not 1 <= pedido.minutos <= 60:
+        raise HTTPException(status_code=400, detail="minutos deve ficar entre 1 e 60.")
+    problema = diagnostico_ollama()
+    if problema:
+        raise HTTPException(status_code=503, detail=problema)
+
+    job_id = _registrar_job(f"recap de {pedido.dias} dias", tipo="recap")
+    tarefas.add_task(
+        _rodar_especialista,
+        job_id,
+        pedido.webhook_url,
+        lambda: recap.gerar_recap(pedido.dias, pedido.formato, minutos=pedido.minutos),
+    )
+    return {
+        "status": "Recebido! Revisando a semana...",
+        "job_id": job_id,
+        "acompanhe_em": f"/status/{job_id}",
+    }
+
+
+@app.post("/critica")
+def executar_critica(pedido: PedidoCritica, tarefas: BackgroundTasks):
+    """Crítico de Texto sobre um texto pronto; `referencia` liga a conferência
+    de fatos. O limite de tamanho é checado aqui, no caminho síncrono."""
+    _validar_webhook(pedido.webhook_url)
+    try:
+        critica.validar_pedido(pedido.texto, pedido.referencia)
+    except critica.ErroCritica as erro:
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+    problema = diagnostico_ollama()
+    if problema:
+        raise HTTPException(status_code=503, detail=problema)
+
+    job_id = _registrar_job(pedido.texto, tipo="critica")
+    tarefas.add_task(
+        _rodar_especialista,
+        job_id,
+        pedido.webhook_url,
+        lambda: critica.gerar_critica(pedido.texto, pedido.foco, pedido.referencia),
+    )
+    return {
+        "status": "Recebido! Revisando o texto...",
+        "job_id": job_id,
+        "acompanhe_em": f"/status/{job_id}",
     }
 
 

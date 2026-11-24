@@ -13,6 +13,12 @@ terminal sandboxed) → `Engenheiro de Qualidade`, gerando o arquivo final em
 `output/`. Roda pelo terminal (`python main.py`) ou como **API HTTP** para o
 n8n (`python api.py`).
 
+**Especialistas (fora do pipeline principal, entrada fechada):** `Revisor de
+Projetos` (revisão semanal dos projetos a partir do git — SYS-16 R.E.C.A.P.,
+`python recap.py`), `Crítico de Texto` (confere um texto contra uma
+referência e devolve a versão corrigida — `python critica.py`) e
+`Roteirista do Podcast Semanal` (adapta a revisão para o Estúdio de Podcast).
+
 **Capacidades por nível:** (1) lê pastas/arquivos locais; (2) memória de
 longo prazo via ChromaDB + embeddings locais; (3) API FastAPI; (4) API
 assíncrona (não trava o n8n) + agente com terminal sandboxed; (5) painel
@@ -122,6 +128,10 @@ NexusCortex(NCX)/
 ├── main.py            # a agência: agentes, tarefas, ferramentas, orquestração
 ├── api.py             # API HTTP: /agencia (n8n), /podcast, /v1 OpenAI-compat
 ├── podcast.py         # Estúdio de Podcast: roteiro -> vozes -> programa final
+├── especialistas.py   # papéis novos: Revisor de Projetos, Crítico, Roteirista
+├── recap.py           # revisão semanal (git + PROJECTS.md -> relatório/roteiro)
+├── critica.py         # Crítico de Texto sobre um arquivo/texto pronto
+├── ruff.toml          # lint (E4/E7/E9/F, mesmo padrão da OuroborosEngine)
 ├── ui.py              # painel visual em Streamlit (conversa com a api.py)
 ├── web/estudio.html   # painel do Estúdio de Podcast (servido em /estudio)
 ├── cortexus.bat       # launcher de um clique: API + painel (Windows)
@@ -256,6 +266,29 @@ python api.py --reload           # idem, recarregando ao editar o código (dev)
 - **Limites:** rode com **um único worker** (o registro de jobs é em
   memória); reiniciar o servidor (inclusive pelo `--reload`) perde os jobs
   em andamento.
+
+Especialistas (revisão semanal e crítica de texto):
+```bash
+python recap.py --so-coletar          # só os dados do git da semana (sem Ollama)
+python recap.py                       # relatório -> output/recap/recap_<data>.md
+python recap.py --dias 14 --roteiro   # roteiro 'Rafa: ... / Bruno: ...' p/ o Estúdio
+python critica.py README.md --foco "mais curto"
+python critica.py roteiro.txt --referencia pauta.md   # confere os fatos
+```
+- `GET /recap/coleta?dias=7`, `POST /recap` (`{"dias", "formato":
+  "relatorio"|"roteiro", "minutos"}`) e `POST /critica` (`{"texto",
+  "foco", "referencia"}`) seguem o contrato do `/agencia`: `job_id` na hora,
+  `/status` por polling, webhook opcional.
+- **A coleta é código, não agente.** Os commits (`git log` de leitura) e a
+  linha do PROJECTS.md entram no prompt já prontos, com teto de ~4,5 mil
+  caracteres (corta commits antes de cortar projetos). Os três agentes
+  novos **não têm ferramenta** — mesma lição do `busca_web`: passo
+  essencial mora no código. O Crítico recebe os mesmos dados do Revisor e
+  corta progresso que não está nos commits (o risco do 7B no blueprint).
+- **A pasta de projetos** é `NCX_PROJETOS` ou a pasta-mãe deste projeto. A
+  API **não aceita caminho do cliente**: sem autenticação, `git log` de
+  pasta arbitrária seria vazamento.
+- O palpite de próximo passo é só texto; nada escreve no PROJECTS.md.
 
 ### Atalho de um clique (o jeito mais fácil)
 
@@ -494,6 +527,13 @@ Confirmação cruzada:
       avaliar o XTTS-v2 (VRAM disputada com o qwen + licença CPML
       não-comercial) ou treinar uma voz.
 - [ ] Autenticação (token) na API se for exposta além do `127.0.0.1`.
+- [x] Equipe ampliada: Revisor de Projetos, Crítico de Texto e Roteirista
+      do Podcast Semanal (`recap.py`, `critica.py`, rotas `/recap` e
+      `/critica`). Ruff com config (`ruff.toml`).
+- [ ] R.E.C.A.P. ponta a ponta: narrar o roteiro direto do `/recap` e
+      copiar o MP3 para a pasta do Youtify (hoje: `python podcast.py
+      <roteiro>` ou colar no `/estudio`). Medir num job real se o Crítico
+      de fato corta progresso inventado.
 - [ ] O agente Escritor nem sempre aciona o terminal para auto-testar o
       código (limitação do modelo 7B) — avaliar um passo de verificação
       determinístico pós-geração para scripts `.py`.

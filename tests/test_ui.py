@@ -5,8 +5,6 @@ auxiliares puras são testadas direto."""
 
 from __future__ import annotations
 
-import io
-
 from streamlit.testing.v1 import AppTest
 
 import ui
